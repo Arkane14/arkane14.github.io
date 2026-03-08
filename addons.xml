@@ -20,7 +20,7 @@
             <icon>icon.png</icon>
             <fanart>fanart.jpg</fanart>
         </assets>
-        <news>v1.4.0: renommage en plugin.video.dltv (DLTV)</news>
+        <news>v1.0.0: DLTV deployment</news>
     </extension>
 </addon>
 <addon id="repository.arkane14" name="Arkane14 Repository" version="1.0.0" provider-name="Arkane14">
