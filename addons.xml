@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <addons>
-<addon id="plugin.video.dltv" name="DLTV" version="1.0.14" provider-name="Arkane14">
+<addon id="plugin.video.dltv" name="DLTV" version="1.0.15" provider-name="Arkane14">
     <requires>
         <import addon="xbmc.python" version="3.0.0"/>
         <import addon="script.module.requests" />
@@ -20,7 +20,7 @@
             <icon>icon.png</icon>
             <fanart>fanart.jpg</fanart>
         </assets>
-        <news>v1.0.14: strip CHEVY PNG wrapper in segment proxy for Android compatibility</news>
+        <news>v1.0.15: extend PNG wrapper scan to full segment body (was limited to 1024B)</news>
     </extension>
 </addon>
 <addon id="repository.arkane14" name="Arkane14 Repository" version="1.0.0" provider-name="Arkane14">
