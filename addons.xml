@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <addons>
-<addon id="plugin.video.dltv" name="DLTV" version="1.0.16" provider-name="Arkane14">
+<addon id="plugin.video.dltv" name="DLTV" version="1.0.19" provider-name="Arkane14">
     <requires>
         <import addon="xbmc.python" version="3.0.0"/>
         <import addon="script.module.requests" />
@@ -20,7 +20,7 @@
             <icon>icon.png</icon>
             <fanart>fanart.jpg</fanart>
         </assets>
-        <news>v1.0.16: skip CHEVY sources serving PNG placeholder images (probe first segment before committing)</news>
+        <news>v1.0.19: Detect cdn.gptimage15.com placeholder CDN via URL (AES-encrypted segments undetectable by byte probe)</news>
     </extension>
 </addon>
 <addon id="repository.arkane14" name="Arkane14 Repository" version="1.0.0" provider-name="Arkane14">
