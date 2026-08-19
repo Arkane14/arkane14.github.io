@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<addons>
+<addon id="plugin.video.dltv" name="DLTV" version="1.0.27" provider-name="arkane14">
+    <requires>
+        <import addon="xbmc.python" version="3.0.0"/>
+        <import addon="script.module.requests" />
+        <import addon="script.module.inputstreamhelper" />
+        <import addon="inputstream.ffmpegdirect" />
+        <import addon="script.module.six"/>
+    </requires>
+    <extension point="xbmc.python.pluginsource" library="addon.py">
+        <provides>video</provides>
+    </extension>
+    <extension point="xbmc.addon.metadata">
+        <summary lang="en">Live TV and Sports</summary>
+        <description lang="en">Live TV and Sports</description>
+        <platform>all</platform>
+        <license>GNU GENERAL PUBLIC LICENSE. Version 2, June 1991</license>
+        <assets>
+            <icon>icon.png</icon>
+            <fanart>fanart.jpg</fanart>
+        </assets>
+    </extension>
+</addon>
+<addon id="repository.arkane14" name="arkane14 Repository" version="1.0.0" provider-name="arkane14">
+    <requires>
+        <import addon="xbmc.python" version="3.0.0"/>
+    </requires>
+    <extension point="xbmc.addon.repository" name="arkane14 Repository">
+        <dir>
+            <info compressed="false">https://arkane14.github.io/addons.xml</info>
+            <checksum>https://arkane14.github.io/addons.xml.md5</checksum>
+            <datadir zip="true">https://raw.githubusercontent.com/arkane14/arkane14.github.io/main/</datadir>
+        </dir>
+    </extension>
+    <extension point="xbmc.addon.metadata">
+        <summary lang="en">arkane14 Repository</summary>
+        <description lang="en">arkane14 Kodi addon repository</description>
+        <platform>all</platform>
+        <assets>
+            <icon>icon.png</icon>
+        </assets>
+    </extension>
+</addon>
+</addons>
