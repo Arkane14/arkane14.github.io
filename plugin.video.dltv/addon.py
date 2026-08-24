@@ -870,6 +870,38 @@ def _fetch_auth_credentials(channel_id, max_attempts=3):
     return None, None
 
 
+def _fetch_direct_m3u8_url(channel_id):
+    """New backend format: the auth player page embeds the final signed m3u8 URL as a
+    base64 literal (source:window.atob('...')). Returns (m3u8_url, player_referer) or
+    (None, None). Tries daddy.php (current) and daddyhd.php (legacy) on each known base."""
+    stream_referer = abs_url(f'stream/stream-{channel_id}.php')
+    bases = [_KSOHLS_BASE] + [b for b in _KSOHLS_FALLBACK_BASES if b != _KSOHLS_BASE]
+    seen = []
+    for base in bases:
+        if base in seen:
+            continue
+        seen.append(base)
+        for path in ('/premiumtv/daddy.php', '/premiumtv/daddyhd.php'):
+            try:
+                r = _get_session().get(f'{base}{path}?id={channel_id}', headers={
+                    'User-Agent': UA,
+                    'Referer': stream_referer,
+                }, timeout=4)
+                if r.status_code != 200 or _is_js_challenge(r.text):
+                    continue
+                mb = re.search(r"atob\('([A-Za-z0-9+/=]+)'\)", r.text)
+                if not mb:
+                    continue
+                u = base64.b64decode(mb.group(1)).decode('utf-8', 'ignore').strip()
+                if u.startswith('http'):
+                    log(f'[EPlayerAuth] direct m3u8 found on {base}{path} for id={channel_id}')
+                    return u, base + '/'
+            except Exception as e:
+                log(f'[EPlayerAuth] direct fetch error on {base}{path}: {e}')
+                continue
+    return None, None
+
+
 def _discover_server_urls():
     """Auto-discover CHEVY_PROXY, CHEVY_LOOKUP and _KSOHLS_BASE from the site's auth player page.
     Fetches stream/stream-1.php → finds premiumtv iframe → parses CHEVY URLs from its JS.
@@ -923,27 +955,30 @@ def _discover_server_urls():
         effective_lookup = chevy_lookup or CHEVY_LOOKUP
 
         log(f'[Discovery] ksohls={ksohls_base} proxy={chevy_proxy} lookup={effective_lookup}')
-        if not chevy_proxy:
-            log('[Discovery] no proxy found — keeping current values')
-            return
 
-        # Update module-level globals (ksohls already validated: not JS-challenge)
         _KSOHLS_BASE = ksohls_base
         PLAYER_REFERER = ksohls_base + '/'
-        CHEVY_PROXY = chevy_proxy
-        CHEVY_LOOKUP = effective_lookup
         _SEG_HEADERS['Origin'] = ksohls_base
         _SEG_HEADERS['Referer'] = PLAYER_REFERER
 
-        # Persist to cache
-        with open(_DISCOVERY_CACHE_FILE, 'w') as _f:
-            json.dump({'ksohls': ksohls_base, 'proxy': chevy_proxy, 'lookup': effective_lookup}, _f)
+        try:
+            with open(_DISCOVERY_CACHE_FILE, 'w') as _f:
+                json.dump({'ksohls': ksohls_base, 'proxy': chevy_proxy, 'lookup': effective_lookup}, _f)
+        except Exception:
+            pass
 
-        # Update Kodi settings so the user can see (and override) discovered values
-        addon.setSetting('chevy_proxy_url', chevy_proxy)
-        addon.setSetting('chevy_lookup_url', effective_lookup)
-        addon.setSetting('ksohls_base_url', ksohls_base)
-        log(f'[Discovery] Updated: proxy={chevy_proxy} lookup={effective_lookup} ksohls={ksohls_base}')
+        if chevy_proxy:
+            CHEVY_PROXY = chevy_proxy
+            CHEVY_LOOKUP = effective_lookup
+            addon.setSetting('chevy_proxy_url', chevy_proxy)
+            addon.setSetting('chevy_lookup_url', effective_lookup)
+            addon.setSetting('ksohls_base_url', ksohls_base)
+            log(f'[Discovery] Updated: proxy={chevy_proxy} lookup={effective_lookup} ksohls={ksohls_base}')
+        else:
+            addon.setSetting('ksohls_base_url', ksohls_base)
+            if effective_lookup:
+                addon.setSetting('chevy_lookup_url', effective_lookup)
+            log(f'[Discovery] Updated ksohls only (page has no literal proxy URL): ksohls={ksohls_base}')
 
     except Exception as e:
         log(f'[Discovery] error: {e}')
@@ -1012,10 +1047,15 @@ def _get_channel_state(channel_key):
 def _refresh_channel_creds(cid, max_attempts=3):
     """Fetch fresh auth credentials + CDN URL, update channel state.
     Returns updated state dict on success, or None on failure."""
+    channel_key = f'premium{cid}'
+    direct_url, pref = _fetch_direct_m3u8_url(cid)
+    if direct_url:
+        log(f'[EPlayerAuth] using new-format direct m3u8 for {channel_key}')
+        _set_channel_state(channel_key, 'noauth', 'noauth', direct_url, player_referer=pref)
+        return _get_channel_state(channel_key)
     at, cs = _fetch_auth_credentials(cid, max_attempts=max_attempts)
     if not (at and cs):
         return None
-    channel_key = f'premium{cid}'
     url = resolve_stream_url(cid)
     _set_channel_state(channel_key, at, cs, url)
     return _get_channel_state(channel_key)
