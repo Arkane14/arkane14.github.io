@@ -1,6 +1,6 @@
 <?xml version='1.0' encoding='UTF-8'?>
 <addons>
-	<addon id="plugin.video.dltv" name="DLTV" version="1.2.0" provider-name="arkane14">
+	<addon id="plugin.video.dltv" name="DLTV" version="1.2.1" provider-name="arkane14">
 		<requires>
 			<import addon="xbmc.python" version="3.0.0" />
 			<import addon="script.module.requests" />
