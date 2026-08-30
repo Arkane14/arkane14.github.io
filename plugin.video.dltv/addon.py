@@ -1059,9 +1059,6 @@ def _refresh_channel_creds(cid, max_attempts=3):
             _last_sent_seq.pop(channel_key, None)
             _sent_seg_urls.pop(channel_key, None)
             _last_media_seq_out.pop(channel_key, None)
-        # Flag pour forcer la lecture directe de m3u8 sans passer par le proxy ptv
-        with _proxy_lock:
-            _channel_creds[channel_key]['use_direct'] = True
         return _get_channel_state(channel_key)
     at, cs = _fetch_auth_credentials(cid, max_attempts=max_attempts)
     if not (at and cs):
@@ -5165,22 +5162,13 @@ def PlayStream(link):
                 xbmcplugin.setResolvedUrl(addon_handle, False, xbmcgui.ListItem())
                 return
             log(f'[PlayStream] Direct premiumtv HLS for {channel_key}: {direct_url}')
-            # État : activer le mode direct (URL m3u8 lue sans passer par le proxy workers.dev)
             _set_channel_state(channel_key, 'direct', 'direct', direct_url, player_referer=direct_ref)
-            with _proxy_lock:
-                _channel_creds[channel_key]['use_direct'] = True
             _ensure_m3u8_proxy()
             _premiumtv_hls = True
-            # Si le mode direct est activé, utiliser l'URL m3u8 directe sans passer
-            # par le proxy (évite les segments workers.dev instables → saccades).
-            if _channel_creds[channel_key].get('use_direct'):
-                m3u8_url = direct_url
-                log(f'[PlayStream] Direct m3u8 mode: URL directe utilisée {direct_url[:80]}...')
-            else:
-                encoded_origin = quote_plus(direct_ref)
-                encoded_url = quote_plus(direct_url)
-                m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/ptv/{encoded_origin}/{encoded_url}'
-                log(f'[PlayStream] Using premiumtv HLS via ptv proxy (inputstream.adaptive): {m3u8_url}')
+            encoded_origin = quote_plus(direct_ref)
+            encoded_url = quote_plus(direct_url)
+            m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/ptv/{encoded_origin}/{encoded_url}'
+            log(f'[PlayStream] Using premiumtv HLS via ptv proxy (inputstream.adaptive): {m3u8_url}')
 
         elif forced_cdn == '__wideiptv__':
             # Player 6 backend (wideiptv.top): clean H.264 HLS with SPS/PPS (unlike some
