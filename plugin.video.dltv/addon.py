@@ -4891,7 +4891,7 @@ def get_direct_hls_url(channel_id):
     """Fetch stream-{id}.php → premiumtv iframe → decode base64 HLS source URL.
     Some channels are served as a plain (unencrypted) HLS stream from the premiumtv
     player page (e.g. xameleon.phantemlis.top) instead of the CHEVY-encrypted CDN.
-    Returns (hls_url, referer_base) or (None, None)."""
+    Returns (hls_url, watch_url) or (None, None)."""
     try:
         watch_url = abs_url(f'watch.php?id={channel_id}')
         stream_page = abs_url(f'stream/stream-{channel_id}.php')
@@ -4925,7 +4925,7 @@ def get_direct_hls_url(channel_id):
         # If the decoded URL is a master playlist, follow the first variant so the
         # TS stream proxy receives a media playlist (its segment parser expects one).
         try:
-            r3 = sess.get(hls_url, headers={'User-Agent': UA, 'Referer': referer_base + '/'}, timeout=8)
+            r3 = sess.get(hls_url, headers={'User-Agent': UA, 'Referer': watch_url + '/'}, timeout=8)
             if r3.status_code == 200 and '#EXT-X-STREAM-INF' in r3.text:
                 for _sl in r3.text.splitlines():
                     _sl = _sl.strip()
@@ -4936,7 +4936,7 @@ def get_direct_hls_url(channel_id):
         except Exception as e:
             log(f'[DirectHls] variant resolution skipped: {e}')
         log(f'[DirectHls] OK ({channel_id}): {hls_url[:100]}')
-        return hls_url, referer_base
+        return hls_url, watch_url
     except Exception as e:
         log(f'[DirectHls] error for id={channel_id}: {e}')
         return None, None
