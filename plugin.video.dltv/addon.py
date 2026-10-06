@@ -549,17 +549,21 @@ def _wide_prefetch_seg(seg_url, slug, attempts=6):
             return
         _wide_seg_queued.add(key)
     hdrs = {'User-Agent': UA, 'Referer': f'https://wideiptv.top/player/{slug}'}
+    # Same fresh-token rebuild as the proxy path: the playlist's own token is
+    # already stale by the time ISA asks for the segment.
+    fetch_url = _wide_freshen_url(seg_url, slug)
     try:
         for i in range(attempts):
             try:
-                r = requests.get(seg_url, headers=hdrs, timeout=5)
+                r = requests.get(fetch_url, headers=hdrs, timeout=5)
                 if r.status_code == 200 and r.content[:1] == b'\x47':
                     _wide_cache_store(key, r.content)
                     log(f'[WidePrefetch] cached {len(r.content)}B {seg_url[-46:]} '
                         f'(try {i + 1}/{attempts})')
                     return
                 if r.status_code not in (404, 403):
-                    log(f'[WidePrefetch] HTTP {r.status_code} {seg_url[-46:]}')
+                    log(f'[WidePrefetch] HTTP {r.status_code} {len(r.content)}B '
+                        f'{seg_url[-40:]}')
             except Exception as e:
                 log(f'[WidePrefetch] try {i + 1}/{attempts} {type(e).__name__}: '
                     f'{seg_url[-40:]}')
@@ -2369,14 +2373,25 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
-            token = _wide_fresh_token(slug)
             # Rebuild the URL with the fresh token (drop any stale one in the query)
-            base_url = raw_url.split('?', 1)[0]
-            qs = parse_qsl(raw_url.split('?', 1)[1], keep_blank_values=True) if '?' in raw_url else []
-            qs = [(k, v) for k, v in qs if k != 'token']
-            qs.append(('token', token))
-            fetch_url = base_url + '?' + urlencode(qs)
+            fetch_url = _wide_freshen_url(raw_url, slug)
             hdrs = {'User-Agent': UA, 'Referer': f'https://wideiptv.top/player/{slug}'}
+            seg_key = _wide_seg_key(fetch_url)
+            # Only verified MPEG-TS bodies ever enter the buffer, so a cache hit
+            # unambiguously means ISA asked for a segment we already hold. Serve it
+            # without touching the network: the prefetch exists precisely for the
+            # moments when this particular connection is going to be dropped, so
+            # looking here *after* fetching would defeat the whole buffer.
+            with _wide_seg_cache_lock:
+                _cached = _wide_seg_cache.get(seg_key)
+            if _cached is not None:
+                log(f'[WideIptvProxy] seg from buffer {len(_cached)}B {fetch_url[-40:]}')
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/MP2T')
+                self.send_header('Content-Length', str(len(_cached)))
+                self.end_headers()
+                self.wfile.write(_cached)
+                return
             r = None
             # The wideiptv CDN drops roughly two connections in three yet serves valid
             # HLS when it answers. Without retries each dropped poll costs a full
@@ -2403,18 +2418,11 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             if r.content[:7] != b'#EXTM3U':
-                # Segment — serve from the prefetch buffer when possible so playback
-                # does not depend on this particular connection landing.
-                _cached = None
-                with _wide_seg_cache_lock:
-                    _cached = _wide_seg_cache.get(_wide_seg_key(fetch_url))
-                if _cached is not None:
-                    log(f'[WideIptvProxy] seg from buffer {len(_cached)}B {fetch_url[-40:]}')
-                    body = _cached
-                else:
-                    body = r.content
-                    if r.status_code == 200 and body[:1] == b'\x47':
-                        _wide_cache_store(_wide_seg_key(fetch_url), body)
+                # Segment. The buffer was already consulted above; a miss here means
+                # no prefetch thread has landed it yet, so fall back to what we got.
+                body = r.content
+                if body[:1] == b'\x47':
+                    _wide_cache_store(seg_key, body)
                 self.send_response(200)
                 self.send_header('Content-Type', 'video/MP2T')
                 self.send_header('Content-Length', str(len(body)))
@@ -5085,6 +5093,8 @@ def get_direct_hls_url(channel_id):
 
 _wide_token_cache = {}
 _wide_token_lock = threading.Lock()
+_wide_token_inflight = {}      # slug -> Event, so one refresh serves all waiters
+_wide_token_inflight_lock = threading.Lock()
 
 
 def _wide_fresh_token(slug, fallback_token=''):
@@ -5094,6 +5104,21 @@ def _wide_fresh_token(slug, fallback_token=''):
         if cached and cached[1] > time.time() + 60:
             return cached[0]
         current = fallback_token or (cached[0] if cached else '')
+
+    # One refresh per slug at a time. The segment prefetch spawns several threads
+    # that all need the same token, and a stampede on refresh_token.php is a fast
+    # way to get throttled by a site that already drops two connections in three.
+    with _wide_token_inflight_lock:
+        ev = _wide_token_inflight.get(slug)
+        leader = ev is None
+        if leader:
+            ev = threading.Event()
+            _wide_token_inflight[slug] = ev
+    if not leader:
+        ev.wait(timeout=12)
+        with _wide_token_lock:
+            cached = _wide_token_cache.get(slug)
+        return cached[0] if cached else current
     try:
         resp = requests.post(
             'https://wideiptv.top/api/refresh_token.php',
@@ -5108,7 +5133,25 @@ def _wide_fresh_token(slug, fallback_token=''):
             return data['token']
     except Exception as e:
         log(f'[WideIptv] token refresh error for {slug}: {e}')
+    finally:
+        with _wide_token_inflight_lock:
+            _wide_token_inflight.pop(slug, None)
+        ev.set()
     return current
+
+
+def _wide_freshen_url(raw_url, slug):
+    """Rebuild a wideiptv URL with a freshly refreshed token.
+
+    Every fetch has to go through this: the token embedded in the upstream
+    playlist goes stale within minutes, and the CDN answers a stale token with
+    HTTP 200 plus an error page instead of a 403. A non-TS 200 body is the tell.
+    """
+    base_url = raw_url.split('?', 1)[0]
+    qs = parse_qsl(raw_url.split('?', 1)[1], keep_blank_values=True) if '?' in raw_url else []
+    qs = [(k, v) for k, v in qs if k != 'token']
+    qs.append(('token', _wide_fresh_token(slug)))
+    return base_url + '?' + urlencode(qs)
 
 
 def _ts_payload_offset(body, window=20, min_ratio=0.8):
