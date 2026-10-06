@@ -1,4 +1,4 @@
-# version: 1.2.24 (doit correspond à addon.xml)
+# version: 1.2.25 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -18,6 +18,7 @@ import sys
 import json
 import html
 import gzip
+import zlib
 import base64
 import hashlib
 import hmac as _hmac
@@ -1218,6 +1219,125 @@ def _refresh_channel_creds(cid, max_attempts=3):
     return _get_channel_state(channel_key)
 
 
+_PTV_ENVELOPE_MAGIC = bytes([84, 73, 75, 84, 73, 75, 80, 88])  # b'TIKTIKPX'
+
+
+def _png_rgb_pixels(data):
+    """Decode a non-interlaced 8-bit PNG (colour type 2 or 6) into raw RGB bytes.
+
+    Written to match pngRGB() in the premiumtv player page, including the five
+    per-scanline filter types — the payload is hidden in the pixel data itself, so
+    the filters have to be reversed exactly as the browser does."""
+    if len(data) < 8 or data[:2] != b'\x89P':
+        return None
+    off = 8
+    w = h = depth = ctype = interlace = 0
+    idat = []
+    while off + 8 <= len(data):
+        length = struct.unpack('>I', data[off:off + 4])[0]
+        if length > len(data) - off - 12:
+            return None
+        ctype_tag = data[off + 4:off + 8]
+        payload = data[off + 8:off + 8 + length]
+        if ctype_tag == b'IHDR':
+            w, h = struct.unpack('>II', payload[:8])
+            depth, ctype = payload[8], payload[9]
+            interlace = payload[12] if len(payload) > 12 else 0
+        elif ctype_tag == b'IDAT':
+            idat.append(payload)
+        elif ctype_tag == b'IEND':
+            break
+        off += 12 + length
+    if not w or not h or depth != 8 or interlace or ctype not in (2, 6):
+        return None
+    try:
+        raw = zlib.decompress(b''.join(idat))
+    except zlib.error:
+        return None
+    bpp = 4 if ctype == 6 else 3
+    stride = w * bpp
+    if len(raw) < (stride + 1) * h:
+        return None
+    out = bytearray(w * h * 3)
+    prev = bytearray(stride)
+    pos = 0
+    for row in range(h):
+        ftype = raw[pos]
+        pos += 1
+        line = bytearray(raw[pos:pos + stride])
+        pos += stride
+        if ftype == 1:
+            for i in range(bpp, stride):
+                line[i] = (line[i] + line[i - bpp]) & 0xFF
+        elif ftype == 2:
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 0xFF
+        elif ftype == 3:
+            for i in range(stride):
+                left = line[i - bpp] if i >= bpp else 0
+                line[i] = (line[i] + ((left + prev[i]) >> 1)) & 0xFF
+        elif ftype == 4:
+            for i in range(stride):
+                a = line[i - bpp] if i >= bpp else 0
+                b = prev[i]
+                c = prev[i - bpp] if i >= bpp else 0
+                dist = a + b - c
+                da, db, dc = abs(dist - a), abs(dist - b), abs(dist - c)
+                pred = a if (da <= db and da <= dc) else (b if db <= dc else c)
+                line[i] = (line[i] + pred) & 0xFF
+        if bpp == 3:
+            out[row * w * 3:(row + 1) * w * 3] = line
+        else:
+            src = 0
+            for x in range(w):
+                out[(row * w + x) * 3:(row * w + x) * 3 + 3] = line[src:src + 3]
+                src += 4
+        prev = line
+    return bytes(out)
+
+
+def _unwrap_ptv_segment(body):
+    """Recover the MPEG-TS that premiumtv wraps inside a PNG image.
+
+    WHAT THIS IS
+    The premiumtv player page ships a custom hls.js fragment loader
+    (`LiveLoader`) whose only job is to unwrap each fragment before handing it to
+    the player. The site serves the segments as PNG images so that ordinary HLS
+    clients — Kodi, inputstream.adaptive, ffmpeg — cannot read them; a browser
+    only plays because that loader unwraps them first.
+
+    WHAT IT DOES HERE
+    This reproduces the same unwrap so Kodi receives plain MPEG-TS. It is the
+    reverse of a deliberate measure by the stream operator, not a fix for a bug:
+    reading these segments required the format they were chosen to hide. It is
+    documented here rather than left implicit so the trade-off stays visible to
+    whoever maintains this.
+
+    The envelope is not encrypted. Layout, per unwrapPixels() in the player:
+      PNG pixels -> b'TIKTIKPX' (8 bytes) -> uint32 big-endian gzip length
+      -> gzip stream -> MPEG-TS.
+    Returns the TS bytes, or None when the body is not one of these envelopes.
+    """
+    if len(body) < 2 or body[:2] != b'\x89P':
+        return None
+    rgb = _png_rgb_pixels(body)
+    if not rgb or len(rgb) < 12 or rgb[:8] != _PTV_ENVELOPE_MAGIC:
+        return None
+    length = struct.unpack('>I', rgb[8:12])[0]
+    if length <= 0 or 12 + length > len(rgb):
+        return None
+    blob = rgb[12:12 + length]
+    if len(blob) < 2 or blob[0] != 0x1f or blob[1] != 0x8b:
+        return None
+    try:
+        ts = zlib.decompress(blob, 16 + zlib.MAX_WBITS)
+    except zlib.error:
+        return None
+    if not ts or ts[0] != 0x47:
+        return None
+    return ts
+
+
 class _EPlayerProxyHandler(BaseHTTPRequestHandler):
     """Local HTTP proxy that:
     - GET /m3u8/<channel_key>  → fetches live m3u8, rewrites key URIs to /key/...
@@ -2353,8 +2473,18 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
             else:
                 # Segment — already buffered by stream=False above
                 body = r.content
+                ct_out = ct or 'video/mp2t'
+                if body[:2] == b'\x89P':
+                    # premiumtv ships its TS inside a PNG envelope; hand adaptive
+                    # the real transport stream instead of the wrapper.
+                    ts = _unwrap_ptv_segment(body)
+                    if ts:
+                        log(f'[PremiumTVProxy] unwrapped PNG envelope '
+                            f'{len(body)}B -> MPEG-TS {len(ts)}B')
+                        body = ts
+                        ct_out = 'video/MP2T'
                 self.send_response(r.status_code)
-                self.send_header('Content-Type', ct or 'video/mp2t')
+                self.send_header('Content-Type', ct_out)
                 self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -3702,7 +3832,7 @@ def toggle_favorite(cid, name):
 
 
 _KNOWN_CDNS = [
-    ('Direct HLS (premiumtv) — souvent placeholder', '__premiumtv__'),
+    ('Direct HLS (premiumtv, envelopes PNG deballées)', '__premiumtv__'),
     ('Direct HLS (wideiptv)',  '__wideiptv__'),
     ('Direct HLS (wideiptv)',  '__wideiptv__'),
     ('Auto — Player direct',  '__anyplayer__'),
@@ -3713,13 +3843,14 @@ _KNOWN_CDNS = [
 # premiumtv/wideiptv first: cheap (one page + one manifest probe each) and they give
 # a clear reachable/placeholder verdict. __anyplayer__ scans six player pages, so it
 # comes last-but-one. CHEVY (None) is the broadest but slowest fallback.
-# Measured over 26 channels: wideiptv serves a valid manifest for 18 of 24, premiumtv for
-# zero — every premiumtv segment came back as a PNG placeholder (19) or a missing
-# manifest (6). premiumtv is a poster-image generator, not a video source, so it only
-# cost 2-3 portal requests and 65 KB of PNG per attempt and was dropped from the cascade.
-# It stays reachable through the manual backend list for the rare CDN rotation where it
-# briefly serves real segments again.
-_PLAYBACK_CASCADE = ['__wideiptv__', '__anyplayer__', '__streampage__', None]
+# Order and membership, from measurements over 26 channels:
+#   wideiptv  — direct MPEG-TS, no portal request once the slug is cached, but the
+#               CDN answered 404 for 6 of 24 slugs, so it cannot be the only option.
+#   premiumtv — its segments are MPEG-TS wrapped inside a PNG envelope, which
+#               /raw/ now unwraps (see _unwrap_ptv_segment). It covers channels the
+#               wideiptv CDN has no content for, at the cost of a portal request.
+#   the rest  — CHEVY, ksohls and StreamPage upstreams have been dead for weeks.
+_PLAYBACK_CASCADE = ['__wideiptv__', '__premiumtv__', '__anyplayer__', '__streampage__', None]
 
 # Playback always goes through the cascade, so asking the user to pick a backend on
 # every click only changed the order of the attempts, never the outcome. The manual
@@ -5323,10 +5454,17 @@ def _placeholder_stream(manifest_url, referer=None, timeout=6):
         if not segs:
             return False
         seg = segs[0] if segs[0].startswith('http') else urljoin(pl_url, segs[0])
-        r = sess.get(seg, headers={**hdrs, 'Range': 'bytes=0-65535'}, timeout=timeout)
+        # The payload is never in the first 64 KB: these envelopes are a PNG, so the
+        # TS only appears after the whole image has been decoded. Range-probing here
+        # would classify every premiumtv channel as a placeholder.
+        r = sess.get(seg, headers=hdrs, timeout=15)
         if r.status_code not in (200, 206):
             return False
         if _ts_payload_offset(r.content) >= 0:
+            return False
+        if _unwrap_ptv_segment(r.content):
+            log('[Placeholder] first segment is a premiumtv PNG envelope with real TS '
+                'inside — not a placeholder')
             return False
         log(f'[Placeholder] no MPEG-TS in first segment ({len(r.content)}B '
             f'magic={r.content[:4]!r}) — placeholder stream')
