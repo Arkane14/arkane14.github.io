@@ -1,4 +1,4 @@
-# version: 1.2.20 (doit correspond à addon.xml)
+# version: 1.2.21 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -112,6 +112,13 @@ _FAILED_CHANNEL_TTL = 600  # 10 minutes — channels with no valid content
 # attempt, and a channel falling through them pays that price on every play.
 _UPSTREAM_DEAD_FILE = os.path.join(_KODI_TEMP, 'dltv_upstream_dead.json')
 _UPSTREAM_DEAD_TTL = 21600  # 6 hours
+# channel id -> wideiptv slug. dlive.sx is the only place that knows which slug
+# belongs to which channel, and it throttles: five channel changes in a minute is
+# enough to make it refuse every request, which kills every backend at once because
+# they all resolve through it. The slug never changes, so one lookup covers a whole
+# zapping session — the token is refreshed separately via wideiptv.top.
+_WIDE_SLUG_FILE = os.path.join(_KODI_TEMP, 'dltv_wideiptv_slugs.json')
+_WIDE_SLUG_TTL = 86400  # 24 hours
 # CDN domains that serve image placeholders (not video) when a channel has no source stream.
 # tempfileb.aiquickdraw.com and liftstory.com are intentionally NOT here — they serve real video.
 # CHEVY stores real MPEG-TS segments on image CDNs (S3, R2, fooocus, visualgpt…) with fake .jpg/.png
@@ -520,6 +527,8 @@ _lovecdn_seg_cache_lock = threading.Lock()
 _wide_seg_cache = {}            # seg_key -> bytes (wideiptv pre-downloaded segments)
 _wide_seg_cache_lock = threading.Lock()
 _wide_seg_queued = set()        # seg_key currently being prefetched
+_wide_slug_cache = {}           # channel id -> {slug, url, token, ts}
+_wide_slug_lock = threading.Lock()
 _wide_dead_segs = {}            # seg_key -> expiry, for segments the CDN does not have
 _wide_seg_keys = []             # insertion order, for bounded eviction
 _WIDE_SEG_CACHE_MAX = 8         # ~5 MB each at 1080p — keep memory in check
@@ -5317,7 +5326,7 @@ _UPSTREAM_DEAD_LOADED = False
 
 
 def _upstream_dead_bootstrap():
-    """Read the persisted dead-upstream list once, on first use.
+    """Read the persisted caches once, on first use.
 
     Deferred behind a flag because this runs at import time, long before the helpers
     below exist."""
@@ -5326,6 +5335,7 @@ def _upstream_dead_bootstrap():
         return
     _UPSTREAM_DEAD_LOADED = True
     _load_upstream_dead()
+    _load_wide_slug_cache()
 
 
 def _load_upstream_dead():
@@ -5435,11 +5445,83 @@ def _cdn_reachable(url, referer=None, timeout=6, attempts=1):
     return False
 
 
+def _load_wide_slug_cache():
+    """Read the persisted channel id -> wideiptv slug map, dropping stale entries."""
+    try:
+        with open(_WIDE_SLUG_FILE, 'r', encoding='utf-8') as f:
+            stored = json.load(f)
+    except Exception:
+        return
+    now = time.time()
+    fresh = {}
+    for cid, entry in (stored or {}).items():
+        try:
+            if now - float(entry['ts']) < _WIDE_SLUG_TTL and entry.get('slug'):
+                fresh[str(cid)] = {'slug': entry['slug'], 'ts': float(entry['ts']),
+                                   'url': entry.get('url', ''), 'token': entry.get('token', '')}
+        except Exception:
+            continue
+    with _wide_slug_lock:
+        _wide_slug_cache.update(fresh)
+    if fresh:
+        log(f'[WideIptv] slug cache: {len(fresh)} channel(s) known, no portal lookup needed')
+
+
+def _save_wide_slug_cache():
+    with _wide_slug_lock:
+        snapshot = {k: {'slug': v['slug'], 'ts': v['ts'], 'url': v.get('url', ''),
+                        'token': v.get('token', '')} for k, v in _wide_slug_cache.items()}
+    try:
+        _dir = os.path.dirname(_WIDE_SLUG_FILE)
+        fd, tmp_path = tempfile.mkstemp(dir=_dir)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(snapshot, f)
+            os.replace(tmp_path, _WIDE_SLUG_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except Exception as e:
+        log(f'[WideIptv] slug cache save failed: {type(e).__name__}')
+
+
+def _wide_slug_cached(channel_id):
+    """Return (slug, base_url, token) for a channel, or None when unknown/stale."""
+    _upstream_dead_bootstrap()
+    with _wide_slug_lock:
+        entry = _wide_slug_cache.get(str(channel_id))
+    if not entry or time.time() - entry['ts'] > _WIDE_SLUG_TTL:
+        return None
+    return entry['slug'], entry.get('url', ''), entry.get('token', '')
+
+
+def _wide_slug_store(channel_id, slug, stream_url, token):
+    with _wide_slug_lock:
+        _wide_slug_cache[str(channel_id)] = {'slug': slug, 'ts': time.time(),
+                                             'url': stream_url, 'token': token}
+    _save_wide_slug_cache()
+
+
 def get_wideiptv_url(channel_id):
     """Player 6 (wideiptv.top) backend: walk stream-{id}.php → daddy.php?stream=SLUG →
     player page, extract the HLS streamUrl + channel slug + token.
-    Returns (stream_url, slug, token) or None."""
+    Returns (stream_url, slug, token) or None.
+
+    A cached slug skips dlive.sx entirely: the token comes from wideiptv.top's own
+    refresh API, so a cached channel needs no portal request at all.
+    """
     try:
+        cached = _wide_slug_cached(channel_id)
+        if cached:
+            slug, base_url, cached_token = cached
+            fresh = _wide_fresh_token(slug, cached_token)
+            # Rebuild with the fresh token; the stored URL's own token is long dead.
+            rebuilt = _wide_freshen_url(base_url, slug) if base_url else ''
+            log(f'[WideIptv] OK ({channel_id}): slug={slug} (cached, no portal request)')
+            return rebuilt, slug, fresh
+
         watch_url = abs_url(f'watch.php?id={channel_id}')
         player_page = abs_url(f'player/stream-{channel_id}.php')
         sess = _get_session()
@@ -5475,6 +5557,7 @@ def get_wideiptv_url(channel_id):
         ms = re.search(r'channelSlug:\s*"([^"]+)"', r3.text)
         slug = ms.group(1) if ms else stream_url.rsplit('/', 2)[-2]
         log(f'[WideIptv] OK ({channel_id}): {stream_url[:90]} slug={slug}')
+        _wide_slug_store(channel_id, slug, stream_url, token)
         return stream_url, slug, token
     except Exception as e:
         log(f'[WideIptv] error for id={channel_id}: {e}')
