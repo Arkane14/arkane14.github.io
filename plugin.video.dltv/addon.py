@@ -498,6 +498,9 @@ _dns_cache = {}  # host -> (ip, timestamp)
 _dns_cache_lock = threading.Lock()
 _original_getaddrinfo = socket.getaddrinfo
 
+_upstream_dead = {}         # host -> (timestamp, last_error) — see _upstream_alive
+_upstream_dead_lock = threading.Lock()
+
 _server_key_cache = {}          # channel_id -> (server_key, timestamp)
 _server_key_cache_lock = threading.Lock()
 _SERVER_KEY_TTL = 600           # 10 min
@@ -3508,6 +3511,9 @@ _KNOWN_CDNS = [
 # comes last-but-one. CHEVY (None) is the broadest but slowest fallback.
 _PLAYBACK_CASCADE = ['__premiumtv__', '__wideiptv__', '__anyplayer__', '__streampage__', None]
 
+_CDN_LABELS = {v: lb for lb, v in _KNOWN_CDNS}
+_CDN_LABELS['__streampage__'] = 'Auto — StreamPage (enviromentalspace)'
+
 def list_favorites():
     favs = get_favorites()
     if not favs:
@@ -5042,6 +5048,36 @@ def _placeholder_stream(manifest_url, referer=None, timeout=6):
         return False
 
 
+def _upstream_alive(url, referer=None, timeout=6):
+    """Cheap liveness probe for non-HLS upstreams (CHEVY serves pseudo-playlists with a
+    .css extension, so _cdn_reachable's #EXTM3U test cannot apply).
+
+    Any HTTP answer counts as alive — including 4xx/5xx — because what matters here is
+    only whether the host completes a TLS handshake and answers at all. Negative results
+    are cached for 5 minutes so a backend cascade does not re-probe a known-dead host
+    for every other channel."""
+    host = url.split('/')[2].lower() if '://' in url else url.lower()
+    now = time.time()
+    with _upstream_dead_lock:
+        _ts = _upstream_dead.get(host)
+        if _ts and now - _ts[0] < 300:
+            log(f'[Upstream] {host} known dead (cached), skipping CHEVY noauth')
+            return False
+    try:
+        hdrs = {'User-Agent': UA}
+        if referer:
+            hdrs['Referer'] = referer
+        _get_session().get(url, headers=hdrs, timeout=timeout)
+    except Exception as e:
+        log(f'[Upstream] {host} unreachable ({type(e).__name__})')
+        with _upstream_dead_lock:
+            _upstream_dead[host] = (now, str(e)[:60])
+        return False
+    with _upstream_dead_lock:
+        _upstream_dead.pop(host, None)
+    return True
+
+
 def _cdn_reachable(url, referer=None, timeout=6):
     """Probe a CDN manifest: True only when it answers 200 with a real HLS playlist.
     Used to avoid handing Kodi a dead CDN (the player then just reports
@@ -5210,6 +5246,9 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
             else:
                 log(f'[PlayStream] Auth also failed — falling back to CHEVY no-auth TS proxy')
                 log(f'[PlayStream] Primary M3U8 URL (noauth fallback): {real_m3u8_url}')
+                if not _upstream_alive(real_m3u8_url):
+                    log('[PlayStream] backend failed: CHEVY no-auth upstream unreachable')
+                    return None
                 _set_channel_state(channel_key, 'noauth', 'noauth', real_m3u8_url)
                 _ensure_m3u8_proxy()
                 m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/stream/{channel_key}'
@@ -5365,6 +5404,9 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
                 use_player6 = True
             else:
                 log('[PlayStream] AnyPlayer fallback failed — using TS stream proxy (noauth)')
+                if not _upstream_alive(real_m3u8_url):
+                    log('[PlayStream] backend failed: CHEVY no-auth upstream unreachable')
+                    return None
                 _set_channel_state(channel_key, 'noauth', 'noauth', real_m3u8_url)
                 _ensure_m3u8_proxy()
                 m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/stream/{channel_key}'
@@ -5410,7 +5452,7 @@ def PlayStream(link):
         # so try the user's pick first and fall through the rest before giving up.
         _order = [forced_cdn] + [c for c in _PLAYBACK_CASCADE if c != forced_cdn]
         for _cdn in _order:
-            _label = next((lb for lb, v in _KNOWN_CDNS if v == _cdn), 'Auto — CHEVY (CDN)')
+            _label = _CDN_LABELS.get(_cdn, 'Auto — CHEVY (CDN)')
             log(f'[PlayStream] trying backend: {_label}')
             _res = _resolve_playback(channel_id, channel_key, _cdn)
             if _res:
