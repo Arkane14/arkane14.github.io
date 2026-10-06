@@ -4520,7 +4520,7 @@ _AP_SKIP_HOSTS = ('sstatic', 'histats', 'adsco', 'fidget', 'chatango',
 _AP_M3U8_RX = re.compile(r'''["'](https?://[^\s"'<>]+\.m3u8[^"']*)["']''')
 _AP_IFRAME_RX = re.compile(r'''<iframe[^>]+src=["'](https?://[^"']{10,200})["']''')
 _AP_STREAM_URL_RX = re.compile(r'''streamUrl\s*:\s*["'](https?:[^"']+)["']''')
-_AP_PATHS = ('stream', 'cast', 'watch', 'plus', 'casting', 'player')
+_AP_PATHS = ('stream', 'cast', 'watch', 'plus', 'casting', 'player', 'embed')
 
 
 def _decode_host(url):
@@ -4847,7 +4847,7 @@ def _try_player_page(channel_id, player_url, watch_url, sess):
 
 
 def get_any_player_stream(channel_id):
-    """Try all player pages (stream, cast, watch, plus, casting, player) in order.
+    """Try all player pages (stream, cast, watch, plus, casting, player, embed) in order.
     Applies auto-detection on each: superdinamico/ligapk, lovecdn-style (domain-agnostic),
     wiki.js, direct .m3u8, generic iframe scan. Skips pages using ksohls.ru (=CHEVY).
     Returns (url, origin) tuple on success, or None if all fail."""
@@ -5037,11 +5037,26 @@ def _placeholder_stream(manifest_url, referer=None, timeout=6):
         m = sess.get(manifest_url, headers=hdrs, timeout=timeout)
         if m.status_code != 200 or not m.text.lstrip().startswith('#EXTM3U'):
             return False
-        segs = [l.strip() for l in m.text.splitlines()
+        pl_url, pl_text = manifest_url, m.text
+        if '#EXT-X-STREAM-INF' in m.text:
+            # Master playlist: the non-comment line is a variant playlist, not a segment.
+            # Probing it as a segment would always report "placeholder" on a perfectly
+            # good stream, so descend to the variant first.
+            variants = [l.strip() for l in m.text.splitlines()
+                        if l.strip() and not l.strip().startswith('#')]
+            if not variants:
+                return False
+            var_url = variants[0] if variants[0].startswith('http') else urljoin(manifest_url, variants[0])
+            vm = sess.get(var_url, headers=hdrs, timeout=timeout)
+            if vm.status_code != 200 or not vm.text.lstrip().startswith('#EXTM3U'):
+                return False
+            pl_url, pl_text = var_url, vm.text
+            log(f'[Placeholder] master playlist -> variant {var_url[:90]}')
+        segs = [l.strip() for l in pl_text.splitlines()
                 if l.strip() and not l.strip().startswith('#')]
         if not segs:
             return False
-        seg = segs[0] if segs[0].startswith('http') else urljoin(manifest_url, segs[0])
+        seg = segs[0] if segs[0].startswith('http') else urljoin(pl_url, segs[0])
         r = sess.get(seg, headers={**hdrs, 'Range': 'bytes=0-65535'}, timeout=timeout)
         if r.status_code not in (200, 206):
             return False
@@ -5085,15 +5100,26 @@ def _upstream_alive(url, referer=None, timeout=6):
     return True
 
 
-def _cdn_reachable(url, referer=None, timeout=6):
+def _cdn_reachable(url, referer=None, timeout=6, attempts=1):
     """Probe a CDN manifest: True only when it answers 200 with a real HLS playlist.
-    Used to avoid handing Kodi a dead CDN (the player then just reports
-    "Error creating demuxer" with no hint about which host failed)."""
-    try:
-        hdrs = {'User-Agent': UA}
-        if referer:
-            hdrs['Referer'] = referer
-        r = _get_session().get(url, headers=hdrs, timeout=timeout)
+
+    Some CDN nodes (ds164.bluetier.top) drop roughly two connections in three yet serve
+    perfectly good HLS when they answer, so connection-level failures are retried while
+    an HTTP verdict (403/404/not-a-playlist) is returned immediately — retrying that
+    would only waste the delay before falling through to the next backend."""
+    hdrs = {'User-Agent': UA}
+    if referer:
+        hdrs['Referer'] = referer
+    for i in range(max(1, attempts)):
+        try:
+            r = _get_session().get(url, headers=hdrs, timeout=timeout)
+        except Exception as e:
+            if i + 1 < attempts:
+                log(f'[CDNProbe] {type(e).__name__} — retry {i + 2}/{attempts}: {url[:70]}')
+                time.sleep(0.8)
+                continue
+            log(f'[CDNProbe] unreachable {type(e).__name__} after {attempts} try: {url[:70]}')
+            return False
         if r.status_code != 200:
             log(f'[CDNProbe] HTTP {r.status_code}: {url[:90]}')
             return False
@@ -5101,9 +5127,7 @@ def _cdn_reachable(url, referer=None, timeout=6):
             log(f'[CDNProbe] not a playlist (first bytes: {r.content[:16]!r}): {url[:90]}')
             return False
         return True
-    except Exception as e:
-        log(f'[CDNProbe] unreachable {type(e).__name__}: {url[:90]}')
-        return False
+    return False
 
 
 def get_wideiptv_url(channel_id):
@@ -5309,7 +5333,8 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
         # The wideiptv CDN nodes go down regularly (ds164.bluetier.top started
         # refusing TCP). Probe it first and fall back to the premiumtv direct HLS
         # instead of letting Kodi fail with a bare "Error creating demuxer".
-        if not _cdn_reachable(w_url, referer=f'https://wideiptv.top/player/{w_slug}'):
+        if not _cdn_reachable(w_url, referer=f'https://wideiptv.top/player/{w_slug}',
+                                  timeout=5, attempts=4):
             log(f'[PlayStream] wideiptv CDN unreachable — falling back to premiumtv direct HLS')
             direct_url, direct_ref = get_direct_hls_url(channel_id)
             if not direct_url:
