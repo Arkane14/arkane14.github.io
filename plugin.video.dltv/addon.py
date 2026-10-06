@@ -1,4 +1,4 @@
-# version: 1.2.19 (doit correspond à addon.xml)
+# version: 1.2.20 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -107,6 +107,11 @@ _CDN_STATUS_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_cdn_status.json')
 _CDN_STATUS_TTL = 300  # 5 minutes
 _FAILED_CHANNELS_FILE = os.path.join(_KODI_TEMP, 'dltv_failed_channels.json')
 _FAILED_CHANNEL_TTL = 600  # 10 minutes — channels with no valid content
+# Upstreams (CHEVY, ksohls, stale CDN nodes) that stopped answering. Persisted
+# because they stay dead across restarts: probing one costs 3-6s of timeout per
+# attempt, and a channel falling through them pays that price on every play.
+_UPSTREAM_DEAD_FILE = os.path.join(_KODI_TEMP, 'dltv_upstream_dead.json')
+_UPSTREAM_DEAD_TTL = 21600  # 6 hours
 # CDN domains that serve image placeholders (not video) when a channel has no source stream.
 # tempfileb.aiquickdraw.com and liftstory.com are intentionally NOT here — they serve real video.
 # CHEVY stores real MPEG-TS segments on image CDNs (S3, R2, fooocus, visualgpt…) with fake .jpg/.png
@@ -5308,30 +5313,92 @@ def _placeholder_stream(manifest_url, referer=None, timeout=6):
         return False
 
 
+_UPSTREAM_DEAD_LOADED = False
+
+
+def _upstream_dead_bootstrap():
+    """Read the persisted dead-upstream list once, on first use.
+
+    Deferred behind a flag because this runs at import time, long before the helpers
+    below exist."""
+    global _UPSTREAM_DEAD_LOADED
+    if _UPSTREAM_DEAD_LOADED:
+        return
+    _UPSTREAM_DEAD_LOADED = True
+    _load_upstream_dead()
+
+
+def _load_upstream_dead():
+    """Read the persisted dead-upstream list, dropping anything past its TTL."""
+    try:
+        with open(_UPSTREAM_DEAD_FILE, 'r', encoding='utf-8') as f:
+            stored = json.load(f)
+    except Exception:
+        return
+    now = time.time()
+    fresh = {}
+    for host, entry in (stored or {}).items():
+        try:
+            ts = float(entry['ts'])
+        except Exception:
+            continue
+        if now - ts < _UPSTREAM_DEAD_TTL:
+            fresh[host] = {'ts': ts, 'error': entry.get('error', '')}
+    with _upstream_dead_lock:
+        _upstream_dead.update(fresh)
+    if fresh:
+        log(f'[Upstream] loaded {len(fresh)} dead upstream(s) from cache: '
+            f'{", ".join(sorted(fresh))}')
+
+
+def _save_upstream_dead():
+    """Persist dead upstreams so the next session skips them without probing."""
+    with _upstream_dead_lock:
+        snapshot = {h: {'ts': v[0], 'error': v[1]} for h, v in _upstream_dead.items()}
+    try:
+        _dir = os.path.dirname(_UPSTREAM_DEAD_FILE)
+        fd, tmp_path = tempfile.mkstemp(dir=_dir)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(snapshot, f)
+            os.replace(tmp_path, _UPSTREAM_DEAD_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except Exception as e:
+        log(f'[Upstream] dead-list save failed: {type(e).__name__}')
+
+
 def _upstream_alive(url, referer=None, timeout=6):
     """Cheap liveness probe for non-HLS upstreams (CHEVY serves pseudo-playlists with a
     .css extension, so _cdn_reachable's #EXTM3U test cannot apply).
 
     Any HTTP answer counts as alive — including 4xx/5xx — because what matters here is
     only whether the host completes a TLS handshake and answers at all. Negative results
-    are cached for 5 minutes so a backend cascade does not re-probe a known-dead host
-    for every other channel."""
+    are cached for 6 hours and written to disk: these hosts go down for days, and probing
+    one on every channel turn costs 3-6s of timeout each time."""
+    _upstream_dead_bootstrap()
     host = url.split('/')[2].lower() if '://' in url else url.lower()
     now = time.time()
     with _upstream_dead_lock:
         _ts = _upstream_dead.get(host)
-        if _ts and now - _ts[0] < 300:
-            log(f'[Upstream] {host} known dead (cached), skipping CHEVY noauth')
-            return False
+    if _ts and now - _ts[0] < _UPSTREAM_DEAD_TTL:
+        log(f'[Upstream] {host} known dead (cached), skipping')
+        return False
     try:
         hdrs = {'User-Agent': UA}
         if referer:
             hdrs['Referer'] = referer
         _get_session().get(url, headers=hdrs, timeout=timeout)
     except Exception as e:
+        # A refused or half-open connection ends up here as [Errno 92] Protocol not
+        # available on some Android builds; the host is just as dead either way.
         log(f'[Upstream] {host} unreachable ({type(e).__name__})')
         with _upstream_dead_lock:
             _upstream_dead[host] = (now, str(e)[:60])
+        _save_upstream_dead()
         return False
     with _upstream_dead_lock:
         _upstream_dead.pop(host, None)
