@@ -513,9 +513,11 @@ _lovecdn_seg_cache_lock = threading.Lock()
 _wide_seg_cache = {}            # seg_key -> bytes (wideiptv pre-downloaded segments)
 _wide_seg_cache_lock = threading.Lock()
 _wide_seg_queued = set()        # seg_key currently being prefetched
+_wide_dead_segs = {}            # seg_key -> expiry, for segments the CDN does not have
 _wide_seg_keys = []             # insertion order, for bounded eviction
 _WIDE_SEG_CACHE_MAX = 8         # ~5 MB each at 1080p — keep memory in check
 _WIDE_PREFETCH_AHEAD = 6        # how many upcoming segments to chase per playlist
+_WIDE_DEAD_TTL = 30             # forget an absent segment after 30s
 _wide_prefetch_on = True
 
 
@@ -542,17 +544,25 @@ def _wide_prefetch_seg(seg_url, slug, attempts=6):
     lossy for inputstream.adaptive to open a stream at all. Chasing segments ahead
     of playback turns that flakiness into a buffer-refill problem instead of a
     dropped-frame problem: as long as segments land faster than real time, ISA
-    never sees a gap."""
+    never sees a gap.
+
+    A 404/403 is treated as terminal, not as flakiness. The log shows the playlist
+    advertising segment paths the CDN does not have; retrying those only steals
+    connections from the segments that could actually play, so they are marked
+    dead for a short window and skipped."""
     key = _wide_seg_key(seg_url)
     with _wide_seg_cache_lock:
         if key in _wide_seg_cache or key in _wide_seg_queued:
             return
+        if _wide_dead_segs.get(key, 0) > time.time():
+            return
+        # Claim the slot atomically, then do every network call outside the lock.
         _wide_seg_queued.add(key)
-    hdrs = {'User-Agent': UA, 'Referer': f'https://wideiptv.top/player/{slug}'}
-    # Same fresh-token rebuild as the proxy path: the playlist's own token is
-    # already stale by the time ISA asks for the segment.
-    fetch_url = _wide_freshen_url(seg_url, slug)
     try:
+        hdrs = {'User-Agent': UA, 'Referer': f'https://wideiptv.top/player/{slug}'}
+        # Same fresh-token rebuild as the proxy path: the playlist's own token is
+        # already stale by the time ISA asks for the segment.
+        fetch_url = _wide_freshen_url(seg_url, slug)
         for i in range(attempts):
             try:
                 r = requests.get(fetch_url, headers=hdrs, timeout=5)
@@ -561,16 +571,30 @@ def _wide_prefetch_seg(seg_url, slug, attempts=6):
                     log(f'[WidePrefetch] cached {len(r.content)}B {seg_url[-46:]} '
                         f'(try {i + 1}/{attempts})')
                     return
-                if r.status_code not in (404, 403):
-                    log(f'[WidePrefetch] HTTP {r.status_code} {len(r.content)}B '
-                        f'{seg_url[-40:]}')
+                if r.status_code in (403, 404):
+                    _wide_mark_dead(key)
+                    log(f'[WidePrefetch] HTTP {r.status_code} — segment absent, '
+                        f'not retrying {seg_url[-40:]}')
+                    return
+                log(f'[WidePrefetch] HTTP {r.status_code} {len(r.content)}B '
+                    f'{seg_url[-40:]} (try {i + 1}/{attempts})')
             except Exception as e:
                 log(f'[WidePrefetch] try {i + 1}/{attempts} {type(e).__name__}: '
                     f'{seg_url[-40:]}')
-                time.sleep(0.3)
+            # Connection drops are the flakiness worth retrying, so pace the retries.
+            time.sleep(0.3)
     finally:
         with _wide_seg_cache_lock:
             _wide_seg_queued.discard(key)
+
+
+def _wide_mark_dead(key, ttl=_WIDE_DEAD_TTL):
+    """Remember a segment the CDN does not have, so we stop asking for it."""
+    with _wide_seg_cache_lock:
+        _wide_dead_segs[key] = time.time() + ttl
+        if len(_wide_dead_segs) > _WIDE_SEG_CACHE_MAX * 2:
+            for k in [k for k, exp in _wide_dead_segs.items() if exp < time.time()]:
+                _wide_dead_segs.pop(k, None)
 
 
 def _wide_prefetch_ahead(seg_urls, slug):
@@ -2421,6 +2445,18 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 # Segment. The buffer was already consulted above; a miss here means
                 # no prefetch thread has landed it yet, so fall back to what we got.
                 body = r.content
+                if not _is_media_segment(body):
+                    # HTTP 200 but the payload is not media: a placeholder image or an
+                    # error page from an expired token. Serving it as video makes
+                    # inputstream.adaptive build a sample reader over garbage, which
+                    # surfaces as "unhandled representation container type" plus
+                    # "Codec id 27 require extradata" and an instant EOF. Refusing is
+                    # what lets adaptive retry the segment instead of dying on it.
+                    log(f'[WideIptvProxy] non-media segment {len(body)}B '
+                        f'{body[:12]!r} {fetch_url[-40:]}')
+                    self.send_response(502)
+                    self.end_headers()
+                    return
                 if body[:1] == b'\x47':
                     _wide_cache_store(seg_key, body)
                 self.send_response(200)
@@ -5152,6 +5188,20 @@ def _wide_freshen_url(raw_url, slug):
     qs = [(k, v) for k, v in qs if k != 'token']
     qs.append(('token', _wide_fresh_token(slug)))
     return base_url + '?' + urlencode(qs)
+
+
+def _is_media_segment(body):
+    """True when body looks like a real media segment rather than a placeholder.
+
+    Deliberately permissive — MPEG-TS (possibly with leading junk, hence the
+    offset scan) or fragmented MP4. A PNG or an HTML error page matches none of
+    these, which is exactly what we need to catch.
+    """
+    if body[:1] == b'\x47':
+        return True
+    if body[4:8] in (b'ftyp', b'styp'):
+        return True
+    return _ts_payload_offset(body) >= 0
 
 
 def _ts_payload_offset(body, window=20, min_ratio=0.8):
