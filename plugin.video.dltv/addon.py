@@ -3511,7 +3511,14 @@ _KNOWN_CDNS = [
 # comes last-but-one. CHEVY (None) is the broadest but slowest fallback.
 _PLAYBACK_CASCADE = ['__premiumtv__', '__wideiptv__', '__anyplayer__', '__streampage__', None]
 
-_CDN_LABELS = {v: lb for lb, v in _KNOWN_CDNS}
+# Playback always goes through the cascade, so asking the user to pick a backend on
+# every click only changed the order of the attempts, never the outcome. The manual
+# list is therefore only offered as a rescue once every backend has failed.
+_AUTOPLAY_CDN = '__auto__'
+_MANUAL_CDNS = [(lb, v) for lb, v in _KNOWN_CDNS if v is not None] + \
+               [('Auto — CHEVY (CDN)', None)]
+
+_CDN_LABELS = {v: lb for lb, v in _MANUAL_CDNS}
 _CDN_LABELS['__streampage__'] = 'Auto — StreamPage (enviromentalspace)'
 
 def list_favorites():
@@ -5431,16 +5438,6 @@ def PlayStream(link):
         log(f'[PlayStream] Channel ID: {channel_id}')
         channel_key = f'premium{channel_id}'
 
-        # CDN selection dialog
-        cdn_idx = xbmcgui.Dialog().select(
-            f'CDN \u2014 ch.{channel_id}',
-            [label for label, _ in _KNOWN_CDNS]
-        )
-        if cdn_idx < 0:
-            xbmcplugin.setResolvedUrl(addon_handle, False, xbmcgui.ListItem())
-            return
-        _, forced_cdn = _KNOWN_CDNS[cdn_idx]
-
         use_player6 = False
         auth_token, channel_salt = None, None
         player_origin = None
@@ -5449,9 +5446,8 @@ def PlayStream(link):
 
         # Backend cascade. The site rotates its players and CDN nodes constantly and
         # several backends are regularly down, geo-gated or serving placeholder images,
-        # so try the user's pick first and fall through the rest before giving up.
-        _order = [forced_cdn] + [c for c in _PLAYBACK_CASCADE if c != forced_cdn]
-        for _cdn in _order:
+        # so walk all of them in order instead of asking the user to pick a dead one.
+        for _cdn in _PLAYBACK_CASCADE:
             _label = _CDN_LABELS.get(_cdn, 'Auto — CHEVY (CDN)')
             log(f'[PlayStream] trying backend: {_label}')
             _res = _resolve_playback(channel_id, channel_key, _cdn)
@@ -5460,7 +5456,20 @@ def PlayStream(link):
                 log(f'[PlayStream] backend OK: {_label}')
                 break
         if not m3u8_url:
-            log(f'[PlayStream] every backend failed for {channel_key}')
+            log(f'[PlayStream] every backend failed for {channel_key} — offering manual list')
+            # Rescue: only now ask which backend to force. The CDN nodes flap constantly,
+            # so a backend that just failed often works on a second attempt; this also
+            # covers codec cases the cascade ordering cannot know about (wideiptv's H.264
+            # on a Kodi that refuses HEVC).
+            _mi = xbmcgui.Dialog().select(f'Aucun backend ne marche — ch.{channel_id}\nForcer lequel?',
+                                          [label for label, _ in _MANUAL_CDNS])
+            if _mi >= 0:
+                _, _forced = _MANUAL_CDNS[_mi]
+                log(f'[PlayStream] forcing backend: {_CDN_LABELS.get(_forced, "CHEVY")}')
+                _res = _resolve_playback(channel_id, channel_key, _forced)
+                if _res:
+                    m3u8_url, _premiumtv_hls, use_player6, player_origin = _res
+        if not m3u8_url:
             xbmcgui.Dialog().notification('DLTV', f'No working stream (ch.{channel_id})', ICON, 4000)
             xbmcplugin.setResolvedUrl(addon_handle, False, xbmcgui.ListItem())
             return
