@@ -4673,6 +4673,13 @@ def _try_player_page(channel_id, player_url, watch_url, sess):
                                 if rp.status_code == 200 and '#EXTM3U' in rp.text[:200]:
                                     _ensure_m3u8_proxy()
                                     port = _actual_proxy_port or M3U8_PROXY_PORT
+                                    # Prime the lovecdn cache with the exact (url, lt_url)
+                                    # pair just verified here. Without it the /lovecdn-ts/
+                                    # proxy re-resolves on its own and falls back to
+                                    # lovetier.bz — whose DNS no longer exists — so the
+                                    # backend was accepted here then answered 502 later.
+                                    with _lovecdn_url_cache_lock:
+                                        _lovecdn_url_cache[stream_name] = (su, time.time(), lt_url)
                                     log(f'[AnyPlayer] lovecdn-style: stream={stream_name} lt={lt_url[:60]}')
                                     return (f'http://127.0.0.1:{port}/lovecdn-ts/{quote_plus(stream_name)}', None)
                                 log(f'[AnyPlayer] lovecdn streamUrl HTTP {rp.status_code} for {stream_name} — skip')
