@@ -1,4 +1,4 @@
-# version: 1.2.16 (doit correspond à addon.xml)
+# version: 1.2.17 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -29,7 +29,7 @@ import threading
 import tempfile
 import concurrent.futures
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlencode, unquote, parse_qsl, quote_plus, urlparse, urljoin
+from urllib.parse import urlencode, unquote, parse_qsl, quote_plus, urlparse, urljoin, urlsplit
 from datetime import datetime, timezone, timedelta
 import time
 import calendar
@@ -496,6 +496,8 @@ def _dns_resolve(hostname, dns_server, port=53, timeout=2):
 
 _dns_cache = {}  # host -> (ip, timestamp)
 _dns_cache_lock = threading.Lock()
+_active_dns = None  # set by _apply_custom_dns after reachability check
+_DNS_FALLBACK = '8.8.8.8'
 _original_getaddrinfo = socket.getaddrinfo
 
 _upstream_dead = {}         # host -> (timestamp, last_error) — see _upstream_alive
@@ -528,6 +530,24 @@ def _wide_seg_key(url):
     return base
 
 
+def _wide_log_tail(url, width=40):
+    """Last part of a wideiptv URL's *path* for logging.
+
+    The token is long, random and differs per request, so slicing the raw URL
+    shows a different tail every time and never says which segment it was."""
+    path = urlsplit(url).path
+    return path[-width:] or path
+
+
+def _wide_is_playlist(url):
+    """True for a manifest rather than a media segment.
+
+    A master playlist lists its variant playlists as plain lines, so without this
+    the prefetcher downloads each media playlist six times looking for MPEG-TS
+    that will never be there."""
+    return urlsplit(url).path.lower().endswith(('.m3u8', '.m3u', '.mpd'))
+
+
 def _wide_cache_store(key, body):
     with _wide_seg_cache_lock:
         if key not in _wide_seg_cache:
@@ -551,13 +571,17 @@ def _wide_prefetch_seg(seg_url, slug, attempts=6):
     connections from the segments that could actually play, so they are marked
     dead for a short window and skipped."""
     key = _wide_seg_key(seg_url)
+    if _wide_is_playlist(seg_url):
+        # A variant playlist, not media. Fetching it would never yield MPEG-TS, so
+        # it can only burn the six attempts below on every master playlist refresh.
+        return
     with _wide_seg_cache_lock:
         if key in _wide_seg_cache or key in _wide_seg_queued:
             return
         if _wide_dead_segs.get(key, 0) > time.time():
             # The interesting case of the three: the CDN already told us this
             # segment does not exist, and we are proving we stop asking.
-            log(f'[WidePrefetch] skip (marked absent) {seg_url[-40:]}')
+            log(f'[WidePrefetch] skip (marked absent) {_wide_log_tail(seg_url)}')
             return
         # Claim the slot atomically, then do every network call outside the lock.
         _wide_seg_queued.add(key)
@@ -571,19 +595,19 @@ def _wide_prefetch_seg(seg_url, slug, attempts=6):
                 r = requests.get(fetch_url, headers=hdrs, timeout=5)
                 if r.status_code == 200 and r.content[:1] == b'\x47':
                     _wide_cache_store(key, r.content)
-                    log(f'[WidePrefetch] cached {len(r.content)}B {seg_url[-46:]} '
+                    log(f'[WidePrefetch] cached {len(r.content)}B {_wide_log_tail(seg_url, 46)} '
                         f'(try {i + 1}/{attempts})')
                     return
                 if r.status_code in (403, 404):
                     _wide_mark_dead(key)
                     log(f'[WidePrefetch] HTTP {r.status_code} — segment absent, '
-                        f'not retrying {seg_url[-40:]}')
+                        f'not retrying {_wide_log_tail(seg_url)}')
                     return
                 log(f'[WidePrefetch] HTTP {r.status_code} {len(r.content)}B '
-                    f'{seg_url[-40:]} (try {i + 1}/{attempts})')
+                    f'{_wide_log_tail(seg_url)} (try {i + 1}/{attempts})')
             except Exception as e:
                 log(f'[WidePrefetch] try {i + 1}/{attempts} {type(e).__name__}: '
-                    f'{seg_url[-40:]}')
+                    f'{_wide_log_tail(seg_url)}')
             # Connection drops are the flakiness worth retrying, so pace the retries.
             time.sleep(0.3)
     finally:
@@ -609,8 +633,7 @@ def _wide_prefetch_ahead(seg_urls, slug):
             continue
         t = threading.Thread(target=_wide_prefetch_seg, args=(u, slug), daemon=True)
         t.start()
-_active_dns = None  # set by _apply_custom_dns after reachability check
-_DNS_FALLBACK = '8.8.8.8'
+
 
 _tls = threading.local()
 
@@ -2417,7 +2440,7 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
             with _wide_seg_cache_lock:
                 _cached = _wide_seg_cache.get(seg_key)
             if _cached is not None:
-                log(f'[WideIptvProxy] seg from buffer {len(_cached)}B {fetch_url[-40:]}')
+                log(f'[WideIptvProxy] seg from buffer {len(_cached)}B {_wide_log_tail(fetch_url)}')
                 self.send_response(200)
                 self.send_header('Content-Type', 'video/MP2T')
                 self.send_header('Content-Length', str(len(_cached)))
@@ -2461,7 +2484,7 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                     # "Codec id 27 require extradata" and an instant EOF. Refusing is
                     # what lets adaptive retry the segment instead of dying on it.
                     log(f'[WideIptvProxy] non-media segment {len(body)}B '
-                        f'{body[:12]!r} {fetch_url[-40:]}')
+                        f'{body[:12]!r} {_wide_log_tail(fetch_url)}')
                     self.send_response(502)
                     self.end_headers()
                     return
