@@ -4910,17 +4910,32 @@ def get_direct_hls_url(channel_id):
         if r2.status_code != 200:
             log(f'[DirectHls] player page HTTP {r2.status_code} for id={channel_id}')
             return None, None
+        hls_url = ''
         m = re.search(r'atob\(\s*[\'"]([A-Za-z0-9+/=]+)[\'"]\s*\)', r2.text)
-        if not m:
-            log(f'[DirectHls] no base64 source on player page for id={channel_id}')
-            return None, None
-        try:
-            hls_url = base64.b64decode(m.group(1)).decode('utf-8')
-        except Exception as e:
-            log(f'[DirectHls] base64 decode error: {e}')
+        if m:
+            try:
+                hls_url = base64.b64decode(m.group(1)).decode('utf-8')
+            except Exception as e:
+                log(f'[DirectHls] base64 decode error: {e}')
+                hls_url = ''
+        if not hls_url:
+            # Current premiumtv pages dropped atob() and expose the CDN URL literally
+            # as `const SRC = "..."`. Without this fallback the only live CDN
+            # (edge.cowedd4855ws.sbs) is invisible and the addon bails out.
+            for _pat in (r'const\s+SRC\s*=\s*[\'"](https?://[^\'"]+)[\'"]',
+                         r'(?:file|src|source)\s*[:=]\s*[\'"](https?://[^\'"]+\.m3u8[^\'"]*)[\'"]',
+                         r'(?:hls|player)\.(?:loadSource|src)\s*\(\s*[\'"](https?://[^\'"]+)[\'"]',
+                         r'[\'"](https?://[^\'"\']*/premium\d+/index\.m3u8[^\'"\']*)[\'"]'):
+                m2 = re.search(_pat, r2.text)
+                if m2:
+                    hls_url = html.unescape(m2.group(1)).strip()
+                    log(f'[DirectHls] literal source on player page: {hls_url[:100]}')
+                    break
+        if not hls_url:
+            log(f'[DirectHls] no source on player page for id={channel_id}')
             return None, None
         if not hls_url.startswith('http'):
-            log(f'[DirectHls] decoded URL not http: {hls_url[:60]}')
+            log(f'[DirectHls] source not http: {hls_url[:60]}')
             return None, None
         # If the decoded URL is a master playlist, follow the first variant so the
         # TS stream proxy receives a media playlist (its segment parser expects one).
@@ -4968,6 +4983,78 @@ def _wide_fresh_token(slug, fallback_token=''):
     except Exception as e:
         log(f'[WideIptv] token refresh error for {slug}: {e}')
     return current
+
+
+def _ts_payload_offset(body, window=20, min_ratio=0.8):
+    """Return the byte offset where a real MPEG-TS stream starts inside body, else -1.
+
+    Requires ~80% of 20 packets at 188-byte spacing to carry the 0x47 sync byte.
+    A lax 3-consecutive-sync check false-positives on PNG payloads (~0.6% of
+    offsets), which would make every placeholder image look like video."""
+    n = len(body)
+    max_off = min(n - 188 * window, 1024 * 1024)
+    for off in range(max(0, max_off)):
+        if body[off] != 0x47 or body[off + 188] != 0x47:
+            continue
+        hits = 0
+        for k in range(window):
+            if body[off + k * 188] == 0x47:
+                hits += 1
+        if hits >= window * min_ratio:
+            return off
+    return -1
+
+
+def _placeholder_stream(manifest_url, referer=None, timeout=6):
+    """True when a live manifest's segments are placeholder images instead of MPEG-TS
+    (channel offline / CDN geo-gate). Only the first 64 KB of the first segment is
+    fetched (the CDN honours Range), so this stays cheap. Without it Kodi just reports
+    "Error creating demuxer" because ffmpeg is handed PNG bytes."""
+    try:
+        sess = _get_session()
+        hdrs = {'User-Agent': UA}
+        if referer:
+            hdrs['Referer'] = referer
+        m = sess.get(manifest_url, headers=hdrs, timeout=timeout)
+        if m.status_code != 200 or not m.text.lstrip().startswith('#EXTM3U'):
+            return False
+        segs = [l.strip() for l in m.text.splitlines()
+                if l.strip() and not l.strip().startswith('#')]
+        if not segs:
+            return False
+        seg = segs[0] if segs[0].startswith('http') else urljoin(manifest_url, segs[0])
+        r = sess.get(seg, headers={**hdrs, 'Range': 'bytes=0-65535'}, timeout=timeout)
+        if r.status_code not in (200, 206):
+            return False
+        if _ts_payload_offset(r.content) >= 0:
+            return False
+        log(f'[Placeholder] no MPEG-TS in first segment ({len(r.content)}B '
+            f'magic={r.content[:4]!r}) — placeholder stream')
+        return True
+    except Exception as e:
+        log(f'[Placeholder] check skipped: {type(e).__name__}: {str(e)[:60]}')
+        return False
+
+
+def _cdn_reachable(url, referer=None, timeout=6):
+    """Probe a CDN manifest: True only when it answers 200 with a real HLS playlist.
+    Used to avoid handing Kodi a dead CDN (the player then just reports
+    "Error creating demuxer" with no hint about which host failed)."""
+    try:
+        hdrs = {'User-Agent': UA}
+        if referer:
+            hdrs['Referer'] = referer
+        r = _get_session().get(url, headers=hdrs, timeout=timeout)
+        if r.status_code != 200:
+            log(f'[CDNProbe] HTTP {r.status_code}: {url[:90]}')
+            return False
+        if not r.text[:400].lstrip().startswith('#EXTM3U'):
+            log(f'[CDNProbe] not a playlist (first bytes: {r.content[:16]!r}): {url[:90]}')
+            return False
+        return True
+    except Exception as e:
+        log(f'[CDNProbe] unreachable {type(e).__name__}: {url[:90]}')
+        return False
 
 
 def get_wideiptv_url(channel_id):
@@ -5163,6 +5250,11 @@ def PlayStream(link):
                 xbmcplugin.setResolvedUrl(addon_handle, False, xbmcgui.ListItem())
                 return
             log(f'[PlayStream] Direct premiumtv HLS for {channel_key}: {direct_url}')
+            if _placeholder_stream(direct_url, referer=direct_ref):
+                log(f'[PlayStream] {channel_key}: CDN serves placeholder images — channel offline')
+                xbmcgui.Dialog().notification('DLTV', f'Channel offline (ch.{channel_id})', ICON, 4000)
+                xbmcplugin.setResolvedUrl(addon_handle, False, xbmcgui.ListItem())
+                return
             _set_channel_state(channel_key, 'direct', 'direct', direct_url, player_referer=direct_ref)
             _ensure_m3u8_proxy()
             _premiumtv_hls = True
@@ -5187,11 +5279,34 @@ def PlayStream(link):
             # starts with a stale token.
             _wide_fresh_token(w_slug, w_token)
             _ensure_m3u8_proxy()
-            encoded_slug = quote_plus(w_slug)
-            encoded_url = quote_plus(w_url)
-            m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/wide/{encoded_slug}/{encoded_url}'
-            log(f'[PlayStream] Using wideiptv HLS via wide proxy (inputstream.adaptive): {m3u8_url}')
-            _premiumtv_hls = True
+            # The wideiptv CDN nodes go down regularly (ds164.bluetier.top started
+            # refusing TCP). Probe it first and fall back to the premiumtv direct HLS
+            # instead of letting Kodi fail with a bare "Error creating demuxer".
+            if not _cdn_reachable(w_url, referer=f'https://wideiptv.top/player/{w_slug}'):
+                log(f'[PlayStream] wideiptv CDN unreachable — falling back to premiumtv direct HLS')
+                direct_url, direct_ref = get_direct_hls_url(channel_id)
+                if not direct_url:
+                    xbmcgui.Dialog().notification('DLTV', f'All CDNs unreachable (ch.{channel_key})', ICON, 4000)
+                    xbmcplugin.setResolvedUrl(addon_handle, False, xbmcgui.ListItem())
+                    return
+                log(f'[PlayStream] Fallback premiumtv HLS for {channel_key}: {direct_url[:100]}')
+                if _placeholder_stream(direct_url, referer=direct_ref):
+                    log(f'[PlayStream] {channel_key}: fallback CDN serves placeholder images — channel offline')
+                    xbmcgui.Dialog().notification('DLTV', f'Channel offline (ch.{channel_id})', ICON, 4000)
+                    xbmcplugin.setResolvedUrl(addon_handle, False, xbmcgui.ListItem())
+                    return
+                _set_channel_state(channel_key, 'direct', 'direct', direct_url, player_referer=direct_ref)
+                encoded_origin = quote_plus(direct_ref)
+                encoded_url = quote_plus(direct_url)
+                m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/ptv/{encoded_origin}/{encoded_url}'
+                log(f'[PlayStream] Using fallback premiumtv HLS via ptv proxy: {m3u8_url}')
+                _premiumtv_hls = True
+            else:
+                encoded_slug = quote_plus(w_slug)
+                encoded_url = quote_plus(w_url)
+                m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/wide/{encoded_slug}/{encoded_url}'
+                log(f'[PlayStream] Using wideiptv HLS via wide proxy (inputstream.adaptive): {m3u8_url}')
+                _premiumtv_hls = True
 
         else:
             # CHEVY path — reuse cached credentials if fresh (< 5 min), otherwise
