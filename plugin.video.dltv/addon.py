@@ -1,4 +1,4 @@
-# version: 1.2.21 (doit correspond à addon.xml)
+# version: 1.2.22 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -5860,7 +5860,17 @@ def PlayStream(link):
         # Backend cascade. The site rotates its players and CDN nodes constantly and
         # several backends are regularly down, geo-gated or serving placeholder images,
         # so walk all of them in order instead of asking the user to pick a dead one.
-        for _cdn in _PLAYBACK_CASCADE:
+        #
+        # wideiptv goes first when its slug is already cached: that path needs no
+        # dlive.sx request, while every other backend starts by asking the portal.
+        # The portal throttles, and zapping across channels is exactly what trips it,
+        # so a channel we can already resolve should never pay for the others first.
+        _order = list(_PLAYBACK_CASCADE)
+        if _wide_slug_cached(channel_id):
+            _order.remove('__wideiptv__')
+            _order.insert(0, '__wideiptv__')
+            log('[PlayStream] slug cached — trying wideiptv first, portal not needed')
+        for _cdn in _order:
             _label = _CDN_LABELS.get(_cdn, 'Auto — CHEVY (CDN)')
             log(f'[PlayStream] trying backend: {_label}')
             _res = _resolve_playback(channel_id, channel_key, _cdn)
