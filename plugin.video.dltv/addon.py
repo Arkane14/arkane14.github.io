@@ -2309,7 +2309,26 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
             qs.append(('token', token))
             fetch_url = base_url + '?' + urlencode(qs)
             hdrs = {'User-Agent': UA, 'Referer': f'https://wideiptv.top/player/{slug}'}
-            r = requests.get(fetch_url, headers=hdrs, timeout=8)
+            r = None
+            # The wideiptv CDN drops roughly two connections in three yet serves valid
+            # HLS when it answers. Without retries each dropped poll costs a full
+            # timeout and inputstream.adaptive aborts the stream ("error opening").
+            # Per-attempt timeout is 5s (the CDN answers in well under a second when it
+            # is up) so three attempts stay well inside adaptive's ~24s give-up window.
+            for _attempt in range(3):
+                try:
+                    r = requests.get(fetch_url, headers=hdrs, timeout=5)
+                    break
+                except Exception as e:
+                    log(f'[WideIptvProxy] attempt {_attempt + 1}/3 failed '
+                        f'({type(e).__name__}): {fetch_url[:60]}')
+                    if _attempt < 2:
+                        time.sleep(0.5)
+            if r is None:
+                log('[WideIptvProxy] upstream unreachable after 3 attempts')
+                self.send_response(502)
+                self.end_headers()
+                return
             if r.status_code != 200:
                 log(f'[WideIptvProxy] HTTP {r.status_code}: {fetch_url[:80]}')
                 self.send_response(502)
