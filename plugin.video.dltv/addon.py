@@ -1,4 +1,4 @@
-# version: 1.2.17 (doit correspond à addon.xml)
+# version: 1.2.18 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -414,6 +414,12 @@ def _do_cleanup_caches():
         stale = [h for h, (_, ts) in list(_dns_cache.items()) if now - ts > 1800]
         for h in stale:
             del _dns_cache[h]
+        # Lift the quarantine after 30 min too, so a host that comes back is
+        # retried by the custom resolver instead of being written off for the
+        # rest of the session.
+        for h in [h for h, ts in list(_dns_bad_hosts_ttl.items()) if now - ts > 1800]:
+            _dns_bad_hosts.discard(h)
+            _dns_bad_hosts_ttl.pop(h, None)
     # Channel creds: purge entries older than 10 min
     with _proxy_lock:
         stale = [k for k, v in list(_channel_creds.items()) if now - v.get('fetched_at', 0) > 600]
@@ -496,9 +502,26 @@ def _dns_resolve(hostname, dns_server, port=53, timeout=2):
 
 _dns_cache = {}  # host -> (ip, timestamp)
 _dns_cache_lock = threading.Lock()
+_dns_bad_hosts = set()  # hosts whose custom-DNS IP refused a connection
+_dns_bad_hosts_ttl = {}  # host -> timestamp the quarantine was set at
 _active_dns = None  # set by _apply_custom_dns after reachability check
 _DNS_FALLBACK = '8.8.8.8'
 _original_getaddrinfo = socket.getaddrinfo
+
+
+def _dns_ip_reachable(ip, port=443, timeout=3):
+    """True when a TCP connection to ip:port is actually established.
+
+    A custom resolver answers long before the host accepts connections. Pinning
+    every lookup to that single answer means one dead IP breaks a host for the
+    whole 30-minute cache TTL with no way back to the system resolver, which is
+    what produced the bursts of [Errno 92] on dlive.sx.
+    """
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
 
 _upstream_dead = {}         # host -> (timestamp, last_error) — see _upstream_alive
 _upstream_dead_lock = threading.Lock()
@@ -814,6 +837,11 @@ def _lovecdn_prefetch_seg(seg_url):
 def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     if not _active_dns or not host:
         return _original_getaddrinfo(host, port, family, type, proto, flags)
+    # Only take over plain AF_INET lookups. Answering an explicit AF_INET6 request
+    # with an AF_INET entry makes the caller build a socket the local stack may
+    # not support, which surfaces as [Errno 92] Protocol not available.
+    if family not in (0, socket.AF_INET):
+        return _original_getaddrinfo(host, port, family, type, proto, flags)
     # Don't intercept IP literals or localhost
     try:
         socket.inet_aton(host)
@@ -824,12 +852,17 @@ def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
         return _original_getaddrinfo(host, port, family, type, proto, flags)
     with _dns_cache_lock:
         entry = _dns_cache.get(host)
+    if host in _dns_bad_hosts:
+        # Already proved unusable this session; stop re-resolving it.
+        return _original_getaddrinfo(host, port, family, type, proto, flags)
     ip = None
+    freshly_resolved = False
     if entry:
         cached_ip, cached_ts = entry
         if time.time() - cached_ts < 1800:  # 30 min TTL
             ip = cached_ip
     if ip is None:
+        freshly_resolved = True
         ip = _dns_resolve(host, _active_dns)
         if ip:
             with _dns_cache_lock:
@@ -846,10 +879,21 @@ def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
             else:
                 log(f'[CustomDNS] resolve failed for {host}, fallback to system DNS')
                 return _original_getaddrinfo(host, port, family, type, proto, flags)
-    results = []
-    for socktype in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
-        results.append((socket.AF_INET, socktype, 0, '', (ip, port or 0)))
-    return results
+    # Prove a freshly resolved answer is usable before pinning it. An IP that
+    # answers DNS but refuses connections is the one case where staying on the
+    # custom resolver is worse than never having used it, so hand the host back to
+    # the system instead of caching the dead answer. Only new answers are tested:
+    # getaddrinfo runs once per connection, and a TCP probe on every call would
+    # double the connections we are trying to keep alive.
+    if ip and freshly_resolved and not _dns_ip_reachable(ip):
+        with _dns_cache_lock:
+            _dns_cache.pop(host, None)
+            _dns_bad_hosts.add(host)
+            _dns_bad_hosts_ttl[host] = time.time()
+        log(f'[CustomDNS] {host} → {ip} refused connection, using system DNS')
+        return _original_getaddrinfo(host, port, family, type, proto, flags)
+    socktypes = (type,) if type else (socket.SOCK_STREAM, socket.SOCK_DGRAM)
+    return [(socket.AF_INET, st, proto, '', (ip, port or 0)) for st in socktypes]
 
 
 def _apply_custom_dns():
