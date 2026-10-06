@@ -1,4 +1,4 @@
-# version: 1.2.5
+# version: 1.2.16 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -555,6 +555,9 @@ def _wide_prefetch_seg(seg_url, slug, attempts=6):
         if key in _wide_seg_cache or key in _wide_seg_queued:
             return
         if _wide_dead_segs.get(key, 0) > time.time():
+            # The interesting case of the three: the CDN already told us this
+            # segment does not exist, and we are proving we stop asking.
+            log(f'[WidePrefetch] skip (marked absent) {seg_url[-40:]}')
             return
         # Claim the slot atomically, then do every network call outside the lock.
         _wide_seg_queued.add(key)
@@ -2401,6 +2404,11 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
             fetch_url = _wide_freshen_url(raw_url, slug)
             hdrs = {'User-Agent': UA, 'Referer': f'https://wideiptv.top/player/{slug}'}
             seg_key = _wide_seg_key(fetch_url)
+            kind = 'manifest' if '.m3u8' in fetch_url else 'segment'
+            # Log every ISA request. Without this, a log with no [WideIptvProxy]
+            # line at all is ambiguous: it can mean ISA never asked, which is very
+            # different from ISA asking and the upstream refusing.
+            log(f'[WideIptvProxy] {kind} request slug={slug} key={seg_key[-24:]}')
             # Only verified MPEG-TS bodies ever enter the buffer, so a cache hit
             # unambiguously means ISA asked for a segment we already hold. Serve it
             # without touching the network: the prefetch exists precisely for the
@@ -2979,6 +2987,10 @@ def log(msg):
             xbmc.log(f'[ DLTV ] Logging Failure: {e}', 2)
         except:
             pass
+
+# Stamp every session with the build that produced it. Logs get rotated and
+# concatenated across versions, so without this a capture cannot be attributed.
+log(f'[DLTV] v{addon.getAddonInfo("version")} loaded')
 
 def should_cache_url(url: str) -> bool:
     """
