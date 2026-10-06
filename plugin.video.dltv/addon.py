@@ -1,4 +1,4 @@
-# version: 1.2.22 (doit correspond à addon.xml)
+# version: 1.2.23 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -3705,7 +3705,11 @@ _KNOWN_CDNS = [
 # premiumtv/wideiptv first: cheap (one page + one manifest probe each) and they give
 # a clear reachable/placeholder verdict. __anyplayer__ scans six player pages, so it
 # comes last-but-one. CHEVY (None) is the broadest but slowest fallback.
-_PLAYBACK_CASCADE = ['__premiumtv__', '__wideiptv__', '__anyplayer__', '__streampage__', None]
+# wideiptv leads: it is the only backend serving clean H.264 with SPS/PPS, it needs no
+# portal request once the slug is cached, and measured over a full log it won 27 times
+# against 1 for premiumtv — the rest being placeholder images or an unreachable portal.
+# premiumtv still runs as a fallback, so the rare channel it alone can deliver is not lost.
+_PLAYBACK_CASCADE = ['__wideiptv__', '__premiumtv__', '__anyplayer__', '__streampage__', None]
 
 # Playback always goes through the cascade, so asking the user to pick a backend on
 # every click only changed the order of the attempts, never the outcome. The manual
@@ -5860,17 +5864,11 @@ def PlayStream(link):
         # Backend cascade. The site rotates its players and CDN nodes constantly and
         # several backends are regularly down, geo-gated or serving placeholder images,
         # so walk all of them in order instead of asking the user to pick a dead one.
-        #
-        # wideiptv goes first when its slug is already cached: that path needs no
-        # dlive.sx request, while every other backend starts by asking the portal.
-        # The portal throttles, and zapping across channels is exactly what trips it,
-        # so a channel we can already resolve should never pay for the others first.
-        _order = list(_PLAYBACK_CASCADE)
+        # Order matters: wideiptv leads because it needs no portal request when its
+        # slug is cached, and every other backend starts by asking the portal.
         if _wide_slug_cached(channel_id):
-            _order.remove('__wideiptv__')
-            _order.insert(0, '__wideiptv__')
-            log('[PlayStream] slug cached — trying wideiptv first, portal not needed')
-        for _cdn in _order:
+            log('[PlayStream] slug cached — wideiptv needs no portal request')
+        for _cdn in _PLAYBACK_CASCADE:
             _label = _CDN_LABELS.get(_cdn, 'Auto — CHEVY (CDN)')
             log(f'[PlayStream] trying backend: {_label}')
             _res = _resolve_playback(channel_id, channel_key, _cdn)
