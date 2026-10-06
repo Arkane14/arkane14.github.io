@@ -3502,6 +3502,12 @@ _KNOWN_CDNS = [
     ('Auto — CHEVY (CDN)',    None),
 ]
 
+# Order the cascade walks the backends when the preferred one cannot deliver video.
+# premiumtv/wideiptv first: cheap (one page + one manifest probe each) and they give
+# a clear reachable/placeholder verdict. __anyplayer__ scans six player pages, so it
+# comes last-but-one. CHEVY (None) is the broadest but slowest fallback.
+_PLAYBACK_CASCADE = ['__premiumtv__', '__wideiptv__', '__anyplayer__', '__streampage__', None]
+
 def list_favorites():
     favs = get_favorites()
     if not favs:
@@ -5151,6 +5157,221 @@ def resolve_stream_url(channel_id, forced_key=None):
         return f'{_proxy_url}/proxy/top1/cdn/{channel_key}/mono.css'
     return f'{_proxy_url}/proxy/{server_key}/{channel_key}/mono.css'
 
+def _resolve_playback(channel_id, channel_key, forced_cdn):
+    """Resolve one playback backend into a Kodi-ready stream URL.
+
+    Returns (m3u8_url, is_hls_via_adaptive, use_player6, player_origin), or None when
+    this backend cannot deliver video. Pure resolution: raises no Kodi dialog, so the
+    caller can walk the whole backend list before reporting a failure to the user."""
+    use_player6 = False
+    auth_token, channel_salt = None, None
+    player_origin = None
+    m3u8_url = None
+    _premiumtv_hls = False
+
+    if forced_cdn == '__anyplayer__':
+        _cross_channel_url = None
+        ap_result = get_any_player_stream(channel_id)
+        if ap_result:
+            _ap_url_tmp, _ = ap_result
+            # Cross-channel viewembed: EPlayerProxy URL for a different channel key
+            # (e.g. eurosport2fr for premium773). The viewembed channel has auth state
+            # (salt/nonce/sig) set up — route via /stream/ so the key is fetched with auth.
+            # CHEVY returns a random dummy key without auth → decryption always fails.
+            _ap_ck = _ap_url_tmp.rsplit('/m3u8/', 1)[-1] if '/m3u8/' in _ap_url_tmp else None
+            if _ap_ck and '127.0.0.1' in _ap_url_tmp and _ap_ck != channel_key:
+                log(f'[PlayStream] AnyPlayer cross-channel ({_ap_ck} ≠ {channel_key}) — routing /stream/ with viewembed auth')
+                _ensure_m3u8_proxy()
+                _cross_channel_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/stream/{_ap_ck}'
+                ap_result = None
+        if _cross_channel_url:
+            m3u8_url = _cross_channel_url
+            log(f'[PlayStream] Using cross-channel TS stream proxy: {m3u8_url}')
+        elif ap_result:
+            real_m3u8_url, player_origin = ap_result
+            log(f'[PlayStream] AnyPlayer URL: {real_m3u8_url} (origin={player_origin})')
+            use_player6 = True
+        else:
+            # AnyPlayer failed — try ksohls auth before noauth (noauth often returns placeholder images)
+            log('[PlayStream] AnyPlayer failed — trying ksohls auth before noauth fallback')
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _ex2:
+                _f_url = _ex2.submit(resolve_stream_url, channel_id, None)
+                _f_auth = _ex2.submit(_fetch_auth_credentials, channel_id)
+                real_m3u8_url = _f_url.result()
+                auth_token, channel_salt = _f_auth.result()
+            if not auth_token:
+                auth_token, channel_salt = get_stream_page_url(channel_id)
+            if auth_token and channel_salt and auth_token != 'noauth':
+                log(f'[PlayStream] AnyPlayer failed but ksohls auth OK — using CHEVY stream proxy')
+                _set_channel_state(channel_key, auth_token, channel_salt, real_m3u8_url)
+                _ensure_m3u8_proxy()
+                m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/stream/{channel_key}'
+                log(f'[PlayStream] Using TS stream proxy (auth): {m3u8_url}')
+            else:
+                log(f'[PlayStream] Auth also failed — falling back to CHEVY no-auth TS proxy')
+                log(f'[PlayStream] Primary M3U8 URL (noauth fallback): {real_m3u8_url}')
+                _set_channel_state(channel_key, 'noauth', 'noauth', real_m3u8_url)
+                _ensure_m3u8_proxy()
+                m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/stream/{channel_key}'
+                log(f'[PlayStream] Using TS stream proxy (no-auth): {m3u8_url}')
+
+    elif forced_cdn == '__streampage__':
+        # StreamPage uses enviromentalspace.cyou auth + CHEVY CDN (TS proxy path)
+        auth_token, channel_salt = get_stream_page_url(channel_id)
+        if not auth_token:
+            log('[PlayStream] backend failed: ' + f'StreamPage unavailable (ch.{channel_id})')
+            return None
+        real_m3u8_url = resolve_stream_url(channel_id)
+        log(f'[PlayStream] StreamPage auth OK, CDN: {real_m3u8_url}')
+
+    elif forced_cdn == '__premiumtv__':
+        # Direct HLS from the premiumtv player page (plain unencrypted stream).
+        # Serve the HLS playlist + segments through the /raw/ proxy so Kodi's
+        # inputstream.adaptive fetches them with the required premiumtv Referer.
+        direct_url, direct_ref = get_direct_hls_url(channel_id)
+        if not direct_url:
+            log('[PlayStream] backend failed: ' + f'Direct HLS unavailable (ch.{channel_id})')
+            return None
+        log(f'[PlayStream] Direct premiumtv HLS for {channel_key}: {direct_url}')
+        if _placeholder_stream(direct_url, referer=direct_ref):
+            log(f'[PlayStream] {channel_key}: CDN serves placeholder images — channel offline')
+            log('[PlayStream] backend failed: ' + f'Channel offline (ch.{channel_id})')
+            return None
+        _set_channel_state(channel_key, 'direct', 'direct', direct_url, player_referer=direct_ref)
+        _ensure_m3u8_proxy()
+        _premiumtv_hls = True
+        encoded_origin = quote_plus(direct_ref)
+        encoded_url = quote_plus(direct_url)
+        m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/ptv/{encoded_origin}/{encoded_url}'
+        log(f'[PlayStream] Using premiumtv HLS via ptv proxy (inputstream.adaptive): {m3u8_url}')
+
+    elif forced_cdn == '__wideiptv__':
+        # Player 6 backend (wideiptv.top): clean H.264 HLS with SPS/PPS (unlike some
+        # premiumtv streams which are HEVC without parameter sets and can't init Kodi's
+        # decoder). Served through the /wide/ proxy so the token is refreshed on demand.
+        w_result = get_wideiptv_url(channel_id)
+        if not w_result:
+            log('[PlayStream] backend failed: ' + f'Wideiptv unavailable (ch.{channel_id})')
+            return None
+        w_url, w_slug, w_token = w_result
+        log(f'[PlayStream] Wideiptv for {channel_key}: {w_url[:100]} slug={w_slug}')
+        # Validate/refresh the token immediately (uses the page token as the
+        # refresh API's current_token) so the first adaptive fetch never
+        # starts with a stale token.
+        _wide_fresh_token(w_slug, w_token)
+        _ensure_m3u8_proxy()
+        # The wideiptv CDN nodes go down regularly (ds164.bluetier.top started
+        # refusing TCP). Probe it first and fall back to the premiumtv direct HLS
+        # instead of letting Kodi fail with a bare "Error creating demuxer".
+        if not _cdn_reachable(w_url, referer=f'https://wideiptv.top/player/{w_slug}'):
+            log(f'[PlayStream] wideiptv CDN unreachable — falling back to premiumtv direct HLS')
+            direct_url, direct_ref = get_direct_hls_url(channel_id)
+            if not direct_url:
+                log('[PlayStream] backend failed: ' + f'All CDNs unreachable (ch.{channel_key})')
+                return None
+            log(f'[PlayStream] Fallback premiumtv HLS for {channel_key}: {direct_url[:100]}')
+            if _placeholder_stream(direct_url, referer=direct_ref):
+                log(f'[PlayStream] {channel_key}: fallback CDN serves placeholder images — channel offline')
+                log('[PlayStream] backend failed: ' + f'Channel offline (ch.{channel_id})')
+                return None
+            _set_channel_state(channel_key, 'direct', 'direct', direct_url, player_referer=direct_ref)
+            encoded_origin = quote_plus(direct_ref)
+            encoded_url = quote_plus(direct_url)
+            m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/ptv/{encoded_origin}/{encoded_url}'
+            log(f'[PlayStream] Using fallback premiumtv HLS via ptv proxy: {m3u8_url}')
+            _premiumtv_hls = True
+        else:
+            encoded_slug = quote_plus(w_slug)
+            encoded_url = quote_plus(w_url)
+            m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/wide/{encoded_slug}/{encoded_url}'
+            log(f'[PlayStream] Using wideiptv HLS via wide proxy (inputstream.adaptive): {m3u8_url}')
+            _premiumtv_hls = True
+
+    else:
+        # CHEVY path — reuse cached credentials if fresh (< 5 min), otherwise
+        # resolve CDN URL and fetch auth in parallel to minimise spinner time.
+        cached = _get_channel_state(channel_key)
+        auth_is_fresh = (cached and cached.get('auth_token')
+                         and cached.get('auth_token') != 'noauth'
+                         and (time.time() - cached.get('fetched_at', 0)) < 300)
+        if auth_is_fresh:
+            real_m3u8_url = resolve_stream_url(channel_id, forced_cdn)
+            auth_token = cached['auth_token']
+            channel_salt = cached['channel_salt']
+            log(f'[PlayStream] Reusing cached credentials for {channel_key}')
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _ex:
+                _fut_resolve = _ex.submit(resolve_stream_url, channel_id, forced_cdn)
+                _fut_auth = _ex.submit(_fetch_auth_credentials, channel_id)
+                real_m3u8_url = _fut_resolve.result()
+                auth_token, channel_salt = _fut_auth.result()
+            if not auth_token:
+                log('[PlayStream] ksohls.ru auth failed — trying StreamPage fallback')
+                auth_token, channel_salt = get_stream_page_url(channel_id)
+        log(f'[PlayStream] Primary M3U8 URL: {real_m3u8_url}')
+
+    if m3u8_url:
+        pass  # already set by __anyplayer__ noauth fallback
+    elif use_player6:
+        # If the detected player returned a required Origin, route through raw proxy.
+        # Otherwise play the URL directly (e.g. lovecdn/ligapk don't need Origin).
+        if player_origin:
+            _ensure_m3u8_proxy()
+            encoded_origin = quote_plus(player_origin)
+            encoded_url = quote_plus(real_m3u8_url)
+            m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/raw/{encoded_origin}/{encoded_url}'
+            log(f'[PlayStream] Using raw proxy for Player6 (origin={player_origin})')
+        else:
+            m3u8_url = real_m3u8_url
+            log(f'[PlayStream] Using Player 6 stream directly')
+    else:
+        if auth_token and channel_salt and auth_token != 'noauth':
+            log(f'[PlayStream] Got auth credentials for {channel_key}')
+            _set_channel_state(channel_key, auth_token, channel_salt, real_m3u8_url)
+            _ensure_m3u8_proxy()
+            m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/stream/{channel_key}'
+            log(f'[PlayStream] Using TS stream proxy: {m3u8_url}')
+        else:
+            # Auth unavailable — try AnyPlayer first (handles channels like ch.121 where
+            # CHEVY key endpoint returns a dummy key, making noauth m3u8 proxy unusable).
+            log('[PlayStream] Auth unavailable — trying AnyPlayer fallback before noauth proxy')
+            _cross_channel_url = None
+            ap_result = get_any_player_stream(channel_id)
+            if ap_result:
+                _ap_url_tmp, _ = ap_result
+                # Cross-channel viewembed: route via /stream/ for the viewembed channel
+                # so key is fetched with auth (CHEVY returns random key without auth).
+                _ap_ck = _ap_url_tmp.rsplit('/m3u8/', 1)[-1] if '/m3u8/' in _ap_url_tmp else None
+                if _ap_ck and '127.0.0.1' in _ap_url_tmp and _ap_ck != channel_key:
+                    log(f'[PlayStream] AnyPlayer cross-channel ({_ap_ck} ≠ {channel_key}) — routing /stream/ with viewembed auth')
+                    _ensure_m3u8_proxy()
+                    _cross_channel_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/stream/{_ap_ck}'
+                    ap_result = None
+            if _cross_channel_url:
+                m3u8_url = _cross_channel_url
+                log(f'[PlayStream] Using cross-channel TS stream proxy: {m3u8_url}')
+            elif ap_result:
+                real_m3u8_url, player_origin = ap_result
+                log(f'[PlayStream] AnyPlayer fallback OK: {real_m3u8_url} (origin={player_origin})')
+                if player_origin:
+                    _ensure_m3u8_proxy()
+                    encoded_origin = quote_plus(player_origin)
+                    encoded_url = quote_plus(real_m3u8_url)
+                    m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/raw/{encoded_origin}/{encoded_url}'
+                    log(f'[PlayStream] Using raw proxy for AnyPlayer fallback (origin={player_origin})')
+                else:
+                    m3u8_url = real_m3u8_url
+                    log(f'[PlayStream] Using AnyPlayer fallback stream directly')
+                use_player6 = True
+            else:
+                log('[PlayStream] AnyPlayer fallback failed — using TS stream proxy (noauth)')
+                _set_channel_state(channel_key, 'noauth', 'noauth', real_m3u8_url)
+                _ensure_m3u8_proxy()
+                m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/stream/{channel_key}'
+                log(f'[PlayStream] Using TS stream proxy (no-auth): {m3u8_url}')
+    return m3u8_url, _premiumtv_hls, use_player6, player_origin
+
+
 def PlayStream(link):
     try:
         log(f'[PlayStream] Starting: {link}')
@@ -5184,212 +5405,23 @@ def PlayStream(link):
         m3u8_url = None
         _premiumtv_hls = False
 
-        if forced_cdn == '__anyplayer__':
-            _cross_channel_url = None
-            ap_result = get_any_player_stream(channel_id)
-            if ap_result:
-                _ap_url_tmp, _ = ap_result
-                # Cross-channel viewembed: EPlayerProxy URL for a different channel key
-                # (e.g. eurosport2fr for premium773). The viewembed channel has auth state
-                # (salt/nonce/sig) set up — route via /stream/ so the key is fetched with auth.
-                # CHEVY returns a random dummy key without auth → decryption always fails.
-                _ap_ck = _ap_url_tmp.rsplit('/m3u8/', 1)[-1] if '/m3u8/' in _ap_url_tmp else None
-                if _ap_ck and '127.0.0.1' in _ap_url_tmp and _ap_ck != channel_key:
-                    log(f'[PlayStream] AnyPlayer cross-channel ({_ap_ck} ≠ {channel_key}) — routing /stream/ with viewembed auth')
-                    _ensure_m3u8_proxy()
-                    _cross_channel_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/stream/{_ap_ck}'
-                    ap_result = None
-            if _cross_channel_url:
-                m3u8_url = _cross_channel_url
-                log(f'[PlayStream] Using cross-channel TS stream proxy: {m3u8_url}')
-            elif ap_result:
-                real_m3u8_url, player_origin = ap_result
-                log(f'[PlayStream] AnyPlayer URL: {real_m3u8_url} (origin={player_origin})')
-                use_player6 = True
-            else:
-                # AnyPlayer failed — try ksohls auth before noauth (noauth often returns placeholder images)
-                log('[PlayStream] AnyPlayer failed — trying ksohls auth before noauth fallback')
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _ex2:
-                    _f_url = _ex2.submit(resolve_stream_url, channel_id, None)
-                    _f_auth = _ex2.submit(_fetch_auth_credentials, channel_id)
-                    real_m3u8_url = _f_url.result()
-                    auth_token, channel_salt = _f_auth.result()
-                if not auth_token:
-                    auth_token, channel_salt = get_stream_page_url(channel_id)
-                if auth_token and channel_salt and auth_token != 'noauth':
-                    log(f'[PlayStream] AnyPlayer failed but ksohls auth OK — using CHEVY stream proxy')
-                    _set_channel_state(channel_key, auth_token, channel_salt, real_m3u8_url)
-                    _ensure_m3u8_proxy()
-                    m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/stream/{channel_key}'
-                    log(f'[PlayStream] Using TS stream proxy (auth): {m3u8_url}')
-                else:
-                    log(f'[PlayStream] Auth also failed — falling back to CHEVY no-auth TS proxy')
-                    log(f'[PlayStream] Primary M3U8 URL (noauth fallback): {real_m3u8_url}')
-                    _set_channel_state(channel_key, 'noauth', 'noauth', real_m3u8_url)
-                    _ensure_m3u8_proxy()
-                    m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/stream/{channel_key}'
-                    log(f'[PlayStream] Using TS stream proxy (no-auth): {m3u8_url}')
-
-        elif forced_cdn == '__streampage__':
-            # StreamPage uses enviromentalspace.cyou auth + CHEVY CDN (TS proxy path)
-            auth_token, channel_salt = get_stream_page_url(channel_id)
-            if not auth_token:
-                xbmcgui.Dialog().notification('DLTV', f'StreamPage unavailable (ch.{channel_id})', ICON, 4000)
-                xbmcplugin.setResolvedUrl(addon_handle, False, xbmcgui.ListItem())
-                return
-            real_m3u8_url = resolve_stream_url(channel_id)
-            log(f'[PlayStream] StreamPage auth OK, CDN: {real_m3u8_url}')
-
-        elif forced_cdn == '__premiumtv__':
-            # Direct HLS from the premiumtv player page (plain unencrypted stream).
-            # Serve the HLS playlist + segments through the /raw/ proxy so Kodi's
-            # inputstream.adaptive fetches them with the required premiumtv Referer.
-            direct_url, direct_ref = get_direct_hls_url(channel_id)
-            if not direct_url:
-                xbmcgui.Dialog().notification('DLTV', f'Direct HLS unavailable (ch.{channel_id})', ICON, 4000)
-                xbmcplugin.setResolvedUrl(addon_handle, False, xbmcgui.ListItem())
-                return
-            log(f'[PlayStream] Direct premiumtv HLS for {channel_key}: {direct_url}')
-            if _placeholder_stream(direct_url, referer=direct_ref):
-                log(f'[PlayStream] {channel_key}: CDN serves placeholder images — channel offline')
-                xbmcgui.Dialog().notification('DLTV', f'Channel offline (ch.{channel_id})', ICON, 4000)
-                xbmcplugin.setResolvedUrl(addon_handle, False, xbmcgui.ListItem())
-                return
-            _set_channel_state(channel_key, 'direct', 'direct', direct_url, player_referer=direct_ref)
-            _ensure_m3u8_proxy()
-            _premiumtv_hls = True
-            encoded_origin = quote_plus(direct_ref)
-            encoded_url = quote_plus(direct_url)
-            m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/ptv/{encoded_origin}/{encoded_url}'
-            log(f'[PlayStream] Using premiumtv HLS via ptv proxy (inputstream.adaptive): {m3u8_url}')
-
-        elif forced_cdn == '__wideiptv__':
-            # Player 6 backend (wideiptv.top): clean H.264 HLS with SPS/PPS (unlike some
-            # premiumtv streams which are HEVC without parameter sets and can't init Kodi's
-            # decoder). Served through the /wide/ proxy so the token is refreshed on demand.
-            w_result = get_wideiptv_url(channel_id)
-            if not w_result:
-                xbmcgui.Dialog().notification('DLTV', f'Wideiptv unavailable (ch.{channel_id})', ICON, 4000)
-                xbmcplugin.setResolvedUrl(addon_handle, False, xbmcgui.ListItem())
-                return
-            w_url, w_slug, w_token = w_result
-            log(f'[PlayStream] Wideiptv for {channel_key}: {w_url[:100]} slug={w_slug}')
-            # Validate/refresh the token immediately (uses the page token as the
-            # refresh API's current_token) so the first adaptive fetch never
-            # starts with a stale token.
-            _wide_fresh_token(w_slug, w_token)
-            _ensure_m3u8_proxy()
-            # The wideiptv CDN nodes go down regularly (ds164.bluetier.top started
-            # refusing TCP). Probe it first and fall back to the premiumtv direct HLS
-            # instead of letting Kodi fail with a bare "Error creating demuxer".
-            if not _cdn_reachable(w_url, referer=f'https://wideiptv.top/player/{w_slug}'):
-                log(f'[PlayStream] wideiptv CDN unreachable — falling back to premiumtv direct HLS')
-                direct_url, direct_ref = get_direct_hls_url(channel_id)
-                if not direct_url:
-                    xbmcgui.Dialog().notification('DLTV', f'All CDNs unreachable (ch.{channel_key})', ICON, 4000)
-                    xbmcplugin.setResolvedUrl(addon_handle, False, xbmcgui.ListItem())
-                    return
-                log(f'[PlayStream] Fallback premiumtv HLS for {channel_key}: {direct_url[:100]}')
-                if _placeholder_stream(direct_url, referer=direct_ref):
-                    log(f'[PlayStream] {channel_key}: fallback CDN serves placeholder images — channel offline')
-                    xbmcgui.Dialog().notification('DLTV', f'Channel offline (ch.{channel_id})', ICON, 4000)
-                    xbmcplugin.setResolvedUrl(addon_handle, False, xbmcgui.ListItem())
-                    return
-                _set_channel_state(channel_key, 'direct', 'direct', direct_url, player_referer=direct_ref)
-                encoded_origin = quote_plus(direct_ref)
-                encoded_url = quote_plus(direct_url)
-                m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/ptv/{encoded_origin}/{encoded_url}'
-                log(f'[PlayStream] Using fallback premiumtv HLS via ptv proxy: {m3u8_url}')
-                _premiumtv_hls = True
-            else:
-                encoded_slug = quote_plus(w_slug)
-                encoded_url = quote_plus(w_url)
-                m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/wide/{encoded_slug}/{encoded_url}'
-                log(f'[PlayStream] Using wideiptv HLS via wide proxy (inputstream.adaptive): {m3u8_url}')
-                _premiumtv_hls = True
-
-        else:
-            # CHEVY path — reuse cached credentials if fresh (< 5 min), otherwise
-            # resolve CDN URL and fetch auth in parallel to minimise spinner time.
-            cached = _get_channel_state(channel_key)
-            auth_is_fresh = (cached and cached.get('auth_token')
-                             and cached.get('auth_token') != 'noauth'
-                             and (time.time() - cached.get('fetched_at', 0)) < 300)
-            if auth_is_fresh:
-                real_m3u8_url = resolve_stream_url(channel_id, forced_cdn)
-                auth_token = cached['auth_token']
-                channel_salt = cached['channel_salt']
-                log(f'[PlayStream] Reusing cached credentials for {channel_key}')
-            else:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _ex:
-                    _fut_resolve = _ex.submit(resolve_stream_url, channel_id, forced_cdn)
-                    _fut_auth = _ex.submit(_fetch_auth_credentials, channel_id)
-                    real_m3u8_url = _fut_resolve.result()
-                    auth_token, channel_salt = _fut_auth.result()
-                if not auth_token:
-                    log('[PlayStream] ksohls.ru auth failed — trying StreamPage fallback')
-                    auth_token, channel_salt = get_stream_page_url(channel_id)
-            log(f'[PlayStream] Primary M3U8 URL: {real_m3u8_url}')
-
-        if m3u8_url:
-            pass  # already set by __anyplayer__ noauth fallback
-        elif use_player6:
-            # If the detected player returned a required Origin, route through raw proxy.
-            # Otherwise play the URL directly (e.g. lovecdn/ligapk don't need Origin).
-            if player_origin:
-                _ensure_m3u8_proxy()
-                encoded_origin = quote_plus(player_origin)
-                encoded_url = quote_plus(real_m3u8_url)
-                m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/raw/{encoded_origin}/{encoded_url}'
-                log(f'[PlayStream] Using raw proxy for Player6 (origin={player_origin})')
-            else:
-                m3u8_url = real_m3u8_url
-                log(f'[PlayStream] Using Player 6 stream directly')
-        else:
-            if auth_token and channel_salt and auth_token != 'noauth':
-                log(f'[PlayStream] Got auth credentials for {channel_key}')
-                _set_channel_state(channel_key, auth_token, channel_salt, real_m3u8_url)
-                _ensure_m3u8_proxy()
-                m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/stream/{channel_key}'
-                log(f'[PlayStream] Using TS stream proxy: {m3u8_url}')
-            else:
-                # Auth unavailable — try AnyPlayer first (handles channels like ch.121 where
-                # CHEVY key endpoint returns a dummy key, making noauth m3u8 proxy unusable).
-                log('[PlayStream] Auth unavailable — trying AnyPlayer fallback before noauth proxy')
-                _cross_channel_url = None
-                ap_result = get_any_player_stream(channel_id)
-                if ap_result:
-                    _ap_url_tmp, _ = ap_result
-                    # Cross-channel viewembed: route via /stream/ for the viewembed channel
-                    # so key is fetched with auth (CHEVY returns random key without auth).
-                    _ap_ck = _ap_url_tmp.rsplit('/m3u8/', 1)[-1] if '/m3u8/' in _ap_url_tmp else None
-                    if _ap_ck and '127.0.0.1' in _ap_url_tmp and _ap_ck != channel_key:
-                        log(f'[PlayStream] AnyPlayer cross-channel ({_ap_ck} ≠ {channel_key}) — routing /stream/ with viewembed auth')
-                        _ensure_m3u8_proxy()
-                        _cross_channel_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/stream/{_ap_ck}'
-                        ap_result = None
-                if _cross_channel_url:
-                    m3u8_url = _cross_channel_url
-                    log(f'[PlayStream] Using cross-channel TS stream proxy: {m3u8_url}')
-                elif ap_result:
-                    real_m3u8_url, player_origin = ap_result
-                    log(f'[PlayStream] AnyPlayer fallback OK: {real_m3u8_url} (origin={player_origin})')
-                    if player_origin:
-                        _ensure_m3u8_proxy()
-                        encoded_origin = quote_plus(player_origin)
-                        encoded_url = quote_plus(real_m3u8_url)
-                        m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/raw/{encoded_origin}/{encoded_url}'
-                        log(f'[PlayStream] Using raw proxy for AnyPlayer fallback (origin={player_origin})')
-                    else:
-                        m3u8_url = real_m3u8_url
-                        log(f'[PlayStream] Using AnyPlayer fallback stream directly')
-                    use_player6 = True
-                else:
-                    log('[PlayStream] AnyPlayer fallback failed — using TS stream proxy (noauth)')
-                    _set_channel_state(channel_key, 'noauth', 'noauth', real_m3u8_url)
-                    _ensure_m3u8_proxy()
-                    m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/stream/{channel_key}'
-                    log(f'[PlayStream] Using TS stream proxy (no-auth): {m3u8_url}')
+        # Backend cascade. The site rotates its players and CDN nodes constantly and
+        # several backends are regularly down, geo-gated or serving placeholder images,
+        # so try the user's pick first and fall through the rest before giving up.
+        _order = [forced_cdn] + [c for c in _PLAYBACK_CASCADE if c != forced_cdn]
+        for _cdn in _order:
+            _label = next((lb for lb, v in _KNOWN_CDNS if v == _cdn), 'Auto — CHEVY (CDN)')
+            log(f'[PlayStream] trying backend: {_label}')
+            _res = _resolve_playback(channel_id, channel_key, _cdn)
+            if _res:
+                m3u8_url, _premiumtv_hls, use_player6, player_origin = _res
+                log(f'[PlayStream] backend OK: {_label}')
+                break
+        if not m3u8_url:
+            log(f'[PlayStream] every backend failed for {channel_key}')
+            xbmcgui.Dialog().notification('DLTV', f'No working stream (ch.{channel_id})', ICON, 4000)
+            xbmcplugin.setResolvedUrl(addon_handle, False, xbmcgui.ListItem())
+            return
 
         _is_ts_proxy = not use_player6 and '127.0.0.1' in m3u8_url and '/stream/' in m3u8_url
         _is_m3u8_proxy = not use_player6 and f'/m3u8/{channel_key}' in m3u8_url
