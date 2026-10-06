@@ -510,6 +510,74 @@ _LOVECDN_URL_TTL = 480          # 8 min (token valid ~15 min)
 _lovecdn_session = requests.Session()  # persistent session — keeps Cloudflare cookies
 _lovecdn_seg_cache = {}         # seg_url -> bytes (pre-downloaded segments, last 6)
 _lovecdn_seg_cache_lock = threading.Lock()
+_wide_seg_cache = {}            # seg_key -> bytes (wideiptv pre-downloaded segments)
+_wide_seg_cache_lock = threading.Lock()
+_wide_seg_queued = set()        # seg_key currently being prefetched
+_wide_seg_keys = []             # insertion order, for bounded eviction
+_WIDE_SEG_CACHE_MAX = 8         # ~5 MB each at 1080p — keep memory in check
+_WIDE_PREFETCH_AHEAD = 6        # how many upcoming segments to chase per playlist
+_wide_prefetch_on = True
+
+
+def _wide_seg_key(url):
+    """Cache key for a wideiptv segment: path only, so a token refresh does not
+    invalidate an already-buffered segment."""
+    base = url.split('?', 1)[0]
+    return base
+
+
+def _wide_cache_store(key, body):
+    with _wide_seg_cache_lock:
+        if key not in _wide_seg_cache:
+            _wide_seg_keys.append(key)
+        _wide_seg_cache[key] = body
+        while len(_wide_seg_keys) > _WIDE_SEG_CACHE_MAX:
+            _wide_seg_cache.pop(_wide_seg_keys.pop(0), None)
+
+
+def _wide_prefetch_seg(seg_url, slug, attempts=6):
+    """Background-download one wideiptv segment into memory.
+
+    The wideiptv CDN drops roughly two connections in three, which is far too
+    lossy for inputstream.adaptive to open a stream at all. Chasing segments ahead
+    of playback turns that flakiness into a buffer-refill problem instead of a
+    dropped-frame problem: as long as segments land faster than real time, ISA
+    never sees a gap."""
+    key = _wide_seg_key(seg_url)
+    with _wide_seg_cache_lock:
+        if key in _wide_seg_cache or key in _wide_seg_queued:
+            return
+        _wide_seg_queued.add(key)
+    hdrs = {'User-Agent': UA, 'Referer': f'https://wideiptv.top/player/{slug}'}
+    try:
+        for i in range(attempts):
+            try:
+                r = requests.get(seg_url, headers=hdrs, timeout=5)
+                if r.status_code == 200 and r.content[:1] == b'\x47':
+                    _wide_cache_store(key, r.content)
+                    log(f'[WidePrefetch] cached {len(r.content)}B {seg_url[-46:]} '
+                        f'(try {i + 1}/{attempts})')
+                    return
+                if r.status_code not in (404, 403):
+                    log(f'[WidePrefetch] HTTP {r.status_code} {seg_url[-46:]}')
+            except Exception as e:
+                log(f'[WidePrefetch] try {i + 1}/{attempts} {type(e).__name__}: '
+                    f'{seg_url[-40:]}')
+                time.sleep(0.3)
+    finally:
+        with _wide_seg_cache_lock:
+            _wide_seg_queued.discard(key)
+
+
+def _wide_prefetch_ahead(seg_urls, slug):
+    """Chase the segments that follow the ones ISA is about to ask for."""
+    if not _wide_prefetch_on or not seg_urls:
+        return
+    for u in seg_urls[-_WIDE_PREFETCH_AHEAD:]:
+        if not u.startswith('http'):
+            continue
+        t = threading.Thread(target=_wide_prefetch_seg, args=(u, slug), daemon=True)
+        t.start()
 _active_dns = None  # set by _apply_custom_dns after reachability check
 _DNS_FALLBACK = '8.8.8.8'
 
@@ -2335,10 +2403,20 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             if r.content[:7] != b'#EXTM3U':
-                # Segment — forward as-is
-                body = r.content
-                self.send_response(r.status_code)
-                self.send_header('Content-Type', r.headers.get('Content-Type', 'video/mp2t'))
+                # Segment — serve from the prefetch buffer when possible so playback
+                # does not depend on this particular connection landing.
+                _cached = None
+                with _wide_seg_cache_lock:
+                    _cached = _wide_seg_cache.get(_wide_seg_key(fetch_url))
+                if _cached is not None:
+                    log(f'[WideIptvProxy] seg from buffer {len(_cached)}B {fetch_url[-40:]}')
+                    body = _cached
+                else:
+                    body = r.content
+                    if r.status_code == 200 and body[:1] == b'\x47':
+                        _wide_cache_store(_wide_seg_key(fetch_url), body)
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/MP2T')
                 self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -2348,13 +2426,16 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
             base = r.url.split('?')[0].rsplit('/', 1)[0] + '/'
             enc_slug = quote_plus(slug)
             lines = []
+            abs_segs = []
             for line in r.text.splitlines():
                 stripped = line.strip()
                 if stripped and not stripped.startswith('#'):
                     abs_seg = stripped if stripped.startswith('http') else urljoin(base, stripped)
+                    abs_segs.append(abs_seg)
                     lines.append(f'http://127.0.0.1:{port}/wide/{enc_slug}/{quote_plus(abs_seg)}')
                 else:
                     lines.append(line)
+            _wide_prefetch_ahead(abs_segs, slug)
             body = '\n'.join(lines).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/vnd.apple.mpegurl')
