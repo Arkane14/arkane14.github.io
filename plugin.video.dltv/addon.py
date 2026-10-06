@@ -1,4 +1,4 @@
-# version: 1.2.23 (doit correspond à addon.xml)
+# version: 1.2.24 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -119,6 +119,12 @@ _UPSTREAM_DEAD_TTL = 21600  # 6 hours
 # zapping session — the token is refreshed separately via wideiptv.top.
 _WIDE_SLUG_FILE = os.path.join(_KODI_TEMP, 'dltv_wideiptv_slugs.json')
 _WIDE_SLUG_TTL = 86400  # 24 hours
+# Slugs the wideiptv CDN answers for with 404 "not found": the site lists them but the
+# CDN holds no content. Measured 6 of 24 (RMCSPORT1/2FR, CANALPL*AF, CNPLSP3AF,
+# beINMAX8FR) — an operator-side feed gap that clears when the channel goes live again,
+# so the mark is short-lived and must not survive the day like a slug does.
+_WIDE_SLUG_ABSENT_FILE = os.path.join(_KODI_TEMP, 'dltv_wideiptv_absent.json')
+_WIDE_SLUG_ABSENT_TTL = 600  # 10 minutes
 # CDN domains that serve image placeholders (not video) when a channel has no source stream.
 # tempfileb.aiquickdraw.com and liftstory.com are intentionally NOT here — they serve real video.
 # CHEVY stores real MPEG-TS segments on image CDNs (S3, R2, fooocus, visualgpt…) with fake .jpg/.png
@@ -529,6 +535,7 @@ _wide_seg_cache_lock = threading.Lock()
 _wide_seg_queued = set()        # seg_key currently being prefetched
 _wide_slug_cache = {}           # channel id -> {slug, url, token, ts}
 _wide_slug_lock = threading.Lock()
+_wide_slug_absent = {}          # slug -> timestamp, CDN has no content for it
 _wide_dead_segs = {}            # seg_key -> expiry, for segments the CDN does not have
 _wide_seg_keys = []             # insertion order, for bounded eviction
 _WIDE_SEG_CACHE_MAX = 8         # ~5 MB each at 1080p — keep memory in check
@@ -3695,7 +3702,8 @@ def toggle_favorite(cid, name):
 
 
 _KNOWN_CDNS = [
-    ('Direct HLS (premiumtv)', '__premiumtv__'),
+    ('Direct HLS (premiumtv) — souvent placeholder', '__premiumtv__'),
+    ('Direct HLS (wideiptv)',  '__wideiptv__'),
     ('Direct HLS (wideiptv)',  '__wideiptv__'),
     ('Auto — Player direct',  '__anyplayer__'),
     ('Auto — CHEVY (CDN)',    None),
@@ -3705,11 +3713,13 @@ _KNOWN_CDNS = [
 # premiumtv/wideiptv first: cheap (one page + one manifest probe each) and they give
 # a clear reachable/placeholder verdict. __anyplayer__ scans six player pages, so it
 # comes last-but-one. CHEVY (None) is the broadest but slowest fallback.
-# wideiptv leads: it is the only backend serving clean H.264 with SPS/PPS, it needs no
-# portal request once the slug is cached, and measured over a full log it won 27 times
-# against 1 for premiumtv — the rest being placeholder images or an unreachable portal.
-# premiumtv still runs as a fallback, so the rare channel it alone can deliver is not lost.
-_PLAYBACK_CASCADE = ['__wideiptv__', '__premiumtv__', '__anyplayer__', '__streampage__', None]
+# Measured over 26 channels: wideiptv serves a valid manifest for 18 of 24, premiumtv for
+# zero — every premiumtv segment came back as a PNG placeholder (19) or a missing
+# manifest (6). premiumtv is a poster-image generator, not a video source, so it only
+# cost 2-3 portal requests and 65 KB of PNG per attempt and was dropped from the cascade.
+# It stays reachable through the manual backend list for the rare CDN rotation where it
+# briefly serves real segments again.
+_PLAYBACK_CASCADE = ['__wideiptv__', '__anyplayer__', '__streampage__', None]
 
 # Playback always goes through the cascade, so asking the user to pick a backend on
 # every click only changed the order of the attempts, never the outcome. The manual
@@ -5340,6 +5350,7 @@ def _upstream_dead_bootstrap():
     _UPSTREAM_DEAD_LOADED = True
     _load_upstream_dead()
     _load_wide_slug_cache()
+    _load_wide_absent()
 
 
 def _load_upstream_dead():
@@ -5508,6 +5519,68 @@ def _wide_slug_store(channel_id, slug, stream_url, token):
     _save_wide_slug_cache()
 
 
+def _load_wide_absent():
+    """Read slugs the CDN reported as absent, dropping marks past their TTL."""
+    try:
+        with open(_WIDE_SLUG_ABSENT_FILE, 'r', encoding='utf-8') as f:
+            stored = json.load(f)
+    except Exception:
+        return
+    now = time.time()
+    fresh = {k: float(v) for k, v in (stored or {}).items() if _safe_float(v) and now - float(v) < _WIDE_SLUG_ABSENT_TTL}
+    with _wide_slug_lock:
+        _wide_slug_absent.update(fresh)
+
+
+def _safe_float(v):
+    try:
+        float(v)
+        return True
+    except Exception:
+        return False
+
+
+def _save_wide_absent():
+    with _wide_slug_lock:
+        snapshot = dict(_wide_slug_absent)
+    try:
+        _dir = os.path.dirname(_WIDE_SLUG_ABSENT_FILE)
+        fd, tmp_path = tempfile.mkstemp(dir=_dir)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(snapshot, f)
+            os.replace(tmp_path, _WIDE_SLUG_ABSENT_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def _wide_slug_mark_absent(slug):
+    """Remember that the CDN holds no content for slug, but only briefly.
+
+    This is not a dead host: the site still advertises the slug and the operator
+    restores it when the channel goes live. Marking it for the full slug TTL would
+    keep a channel dark for a day after a ten-minute gap.
+    """
+    with _wide_slug_lock:
+        _wide_slug_absent[slug] = time.time()
+        # Drop expired marks while we are here so the dict cannot grow unbounded.
+        now = time.time()
+        for k in [k for k, ts in list(_wide_slug_absent.items()) if now - ts > _WIDE_SLUG_ABSENT_TTL]:
+            _wide_slug_absent.pop(k, None)
+    _save_wide_absent()
+
+
+def _wide_slug_is_absent(slug):
+    with _wide_slug_lock:
+        ts = _wide_slug_absent.get(slug)
+    return bool(ts) and time.time() - ts < _WIDE_SLUG_ABSENT_TTL
+
+
 def get_wideiptv_url(channel_id):
     """Player 6 (wideiptv.top) backend: walk stream-{id}.php → daddy.php?stream=SLUG →
     player page, extract the HLS streamUrl + channel slug + token.
@@ -5520,6 +5593,9 @@ def get_wideiptv_url(channel_id):
         cached = _wide_slug_cached(channel_id)
         if cached:
             slug, base_url, cached_token = cached
+            if _wide_slug_is_absent(slug):
+                log(f'[WideIptv] unavailable ({channel_id}): slug {slug} has no CDN content')
+                return None
             fresh = _wide_fresh_token(slug, cached_token)
             # Rebuild with the fresh token; the stored URL's own token is long dead.
             rebuilt = _wide_freshen_url(base_url, slug) if base_url else ''
@@ -5562,6 +5638,18 @@ def get_wideiptv_url(channel_id):
         slug = ms.group(1) if ms else stream_url.rsplit('/', 2)[-2]
         log(f'[WideIptv] OK ({channel_id}): {stream_url[:90]} slug={slug}')
         _wide_slug_store(channel_id, slug, stream_url, token)
+        # Prove the manifest exists before handing the URL over. A 404 here means the
+        # site advertises the slug while the CDN holds no content for it, which is a
+        # temporary operator gap rather than a bad token or a dead host.
+        try:
+            _mr = _get_session().get(stream_url, headers={'User-Agent': UA}, timeout=8)
+            if _mr.status_code == 404:
+                _wide_slug_mark_absent(slug)
+                log(f'[WideIptv] slug {slug} has no CDN content (404) — marked for '
+                    f'{_WIDE_SLUG_ABSENT_TTL // 60} min, skipping this channel')
+                return None
+        except Exception:
+            pass  # reachability is not this check's job; the proxy retries anyway
         return stream_url, slug, token
     except Exception as e:
         log(f'[WideIptv] error for id={channel_id}: {e}')
