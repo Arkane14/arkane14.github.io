@@ -1,4 +1,4 @@
-# version: 1.2.29 (doit correspond à addon.xml)
+# version: 1.2.30 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -546,6 +546,10 @@ _wide_seg_queued = set()        # seg_key currently being prefetched
 _wide_slug_cache = {}           # channel id -> {slug, url, token, ts}
 _wide_slug_lock = threading.Lock()
 _wide_slug_absent = {}          # slug -> timestamp, CDN has no content for it
+# Attempts per upstream poll. The wideiptv CDN nodes refuse about half the
+# connections they receive, so the retry count — not the timeout — is what decides
+# whether a manifest or segment gets through.
+_WIDE_FETCH_ATTEMPTS = 6
 _wide_dead_segs = {}            # seg_key -> expiry, for segments the CDN does not have
 _wide_seg_keys = []             # insertion order, for bounded eviction
 _WIDE_SEG_CACHE_MAX = 8         # ~5 MB each at 1080p — keep memory in check
@@ -840,6 +844,37 @@ def _lovecdn_prefetch_seg(seg_url):
             log(f'[LovecdnPrefetch] cached {len(r.content)}B {seg_url[-50:]}')
     except Exception as e:
         log(f'[LovecdnPrefetch] error: {e}')
+
+
+_wide_unreachable = {}          # host -> consecutive fully-failed poll sets
+
+
+def _wide_note_unreachable(host):
+    """Forget a CDN host's pinned IP after repeated complete failures."""
+    if not host:
+        return
+    with _dns_cache_lock:
+        _wide_unreachable[host] = _wide_unreachable.get(host, 0) + 1
+        n = _wide_unreachable[host]
+    if n >= 2:
+        with _dns_cache_lock:
+            _wide_unreachable.pop(host, None)
+        _dns_forget(host)
+
+
+def _dns_forget(host):
+    """Drop a cached custom-DNS answer so the next lookup re-resolves.
+
+    CDN nodes here are rotated (ds164 -> ds167 -> ds168 over two days) and the old
+    names stop resolving entirely. Without this, an IP pinned for the 30-minute TTL
+    keeps being handed out after the hostname has moved on, so every connection to
+    that node fails for half an hour while the system resolver would have found the
+    new one in a second."""
+    with _dns_cache_lock:
+        had = _dns_cache.pop(host, None)
+    if had:
+        log(f'[CustomDNS] dropped cached {host} → {had[0]} after a connection failure')
+    return had is not None
 
 
 def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -2656,22 +2691,30 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 self.wfile.write(_cached)
                 return
             r = None
-            # The wideiptv CDN drops roughly two connections in three yet serves valid
-            # HLS when it answers. Without retries each dropped poll costs a full
-            # timeout and inputstream.adaptive aborts the stream ("error opening").
-            # Per-attempt timeout is 5s (the CDN answers in well under a second when it
-            # is up) so three attempts stay well inside adaptive's ~24s give-up window.
-            for _attempt in range(3):
+            _host = urlparse(fetch_url).hostname or ''
+            # The wideiptv CDN refuses roughly one connection in two (measured on
+            # ds168: TLS OK / refused / TLS OK / refused...), so retry count is what
+            # decides whether a poll succeeds. At 3 attempts a whole set lands on a
+            # refusal 12.5% of the time; at 6 it is 1.6%. Per-attempt timeout is 5s and
+            # a refused connection returns immediately rather than timing out, so six
+            # attempts still fit inside adaptive's ~24s give-up window.
+            _tries = _WIDE_FETCH_ATTEMPTS
+            for _attempt in range(_tries):
                 try:
                     r = requests.get(fetch_url, headers=hdrs, timeout=5)
                     break
                 except Exception as e:
-                    log(f'[WideIptvProxy] attempt {_attempt + 1}/3 failed '
-                        f'({type(e).__name__}): {fetch_url[:60]}')
-                    if _attempt < 2:
+                    log(f'[WideIptvProxy] attempt {_attempt + 1}/{_tries} failed '
+                        f'({type(e).__name__}): {_wide_log_tail(fetch_url)}')
+                    if _attempt < _tries - 1:
                         time.sleep(0.5)
             if r is None:
-                log('[WideIptvProxy] upstream unreachable after 3 attempts')
+                # A whole retry set lost. On a node that only rejects half the
+                # connections this is bad luck, but a node whose DNS entry moved on
+                # looks identical and keeps failing for the rest of the TTL. Give the
+                # cached IP back so the next request re-resolves.
+                _wide_note_unreachable(_host)
+                log(f'[WideIptvProxy] upstream unreachable after {_tries} attempts')
                 self.send_response(502)
                 self.end_headers()
                 return
