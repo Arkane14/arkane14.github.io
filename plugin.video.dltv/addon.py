@@ -1,4 +1,4 @@
-# version: 1.2.27 (doit correspond à addon.xml)
+# version: 1.2.28 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -531,6 +531,15 @@ _LOVECDN_URL_TTL = 480          # 8 min (token valid ~15 min)
 _lovecdn_session = requests.Session()  # persistent session — keeps Cloudflare cookies
 _lovecdn_seg_cache = {}         # seg_url -> bytes (pre-downloaded segments, last 6)
 _lovecdn_seg_cache_lock = threading.Lock()
+_ptv_seg_cache = {}             # premiumtv segment path -> unwrapped MPEG-TS
+_ptv_seg_keys = []              # insertion order, bounded eviction
+_ptv_seg_lock = threading.Lock()
+# Unwrapping costs ~2 s per segment on an Android box, so a segment decoded twice
+# is two seconds of latency added to the stream. ISA re-requests segments when it
+# loses its buffer, and the proxy is asked again after a retry, so the repeat is
+# common enough to be worth 3 slots of ~5 MB.
+_PTV_SEG_CACHE_MAX = 3
+
 _wide_seg_cache = {}            # seg_key -> bytes (wideiptv pre-downloaded segments)
 _wide_seg_cache_lock = threading.Lock()
 _wide_seg_queued = set()        # seg_key currently being prefetched
@@ -1336,6 +1345,20 @@ def _unwrap_ptv_segment(body):
     if not ts or ts[0] != 0x47:
         return None
     return ts
+
+
+def _ptv_cache_get(key):
+    with _ptv_seg_lock:
+        return _ptv_seg_cache.get(key)
+
+
+def _ptv_cache_store(key, body):
+    with _ptv_seg_lock:
+        if key not in _ptv_seg_cache:
+            _ptv_seg_cache[key] = body
+            _ptv_seg_keys.append(key)
+        while len(_ptv_seg_keys) > _PTV_SEG_CACHE_MAX:
+            _ptv_seg_cache.pop(_ptv_seg_keys.pop(0), None)
 
 
 def _proxy_headers(origin):
@@ -2493,18 +2516,27 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 ct_out = ct or 'video/mp2t'
                 if body[:2] == b'\x89P':
                     # premiumtv ships its TS inside a PNG envelope; hand adaptive
-                    # the real transport stream instead of the wrapper.
-                    _t0 = time.time()
-                    ts = _unwrap_ptv_segment(body)
-                    _ms = (time.time() - _t0) * 1000
-                    if ts:
-                        log(f'[PremiumTVProxy] unwrapped PNG envelope '
-                            f'{len(body)}B -> MPEG-TS {len(ts)}B in {_ms:.0f} ms')
+                    # the real transport stream instead of the wrapper. Unwrapping
+                    # is ~2 s of pure-Python pixel work, so a segment is decoded
+                    # once and reused for every later request for the same path.
+                    _ckey = raw_url.split('?', 1)[0]
+                    ts = _ptv_cache_get(_ckey)
+                    if ts is not None:
                         body = ts
                         ct_out = 'video/MP2T'
                     else:
-                        log(f'[PremiumTVProxy] PNG envelope not unwrapped '
-                            f'({len(body)}B) after {_ms:.0f} ms')
+                        _t0 = time.time()
+                        ts = _unwrap_ptv_segment(body)
+                        _ms = (time.time() - _t0) * 1000
+                        if ts:
+                            log(f'[PremiumTVProxy] unwrapped PNG envelope '
+                                f'{len(body)}B -> MPEG-TS {len(ts)}B in {_ms:.0f} ms')
+                            _ptv_cache_store(_ckey, ts)
+                            body = ts
+                            ct_out = 'video/MP2T'
+                        else:
+                            log(f'[PremiumTVProxy] PNG envelope not unwrapped '
+                                f'({len(body)}B) after {_ms:.0f} ms')
                 self.send_response(r.status_code)
                 self.send_header('Content-Type', ct_out)
                 self.send_header('Content-Length', str(len(body)))
