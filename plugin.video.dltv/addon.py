@@ -1,4 +1,4 @@
-# version: 1.2.32 (doit correspond à addon.xml)
+# version: 1.2.33 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -5933,6 +5933,22 @@ def _wide_current_node(slug):
     return None
 
 
+def _wide_host_resolves(host):
+    """Cheap DNS check on a cached CDN host: one getaddrinfo, no TCP."""
+    if not host:
+        return False
+    try:
+        socket.inet_aton(host)
+        return True
+    except OSError:
+        pass
+    try:
+        socket.getaddrinfo(host, None, socket.AF_INET)
+        return True
+    except Exception:
+        return False
+
+
 def _wide_rebase_node(slug, url):
     """Point a cached URL at the CDN host the site is currently advertising."""
     if not url:
@@ -5940,12 +5956,18 @@ def _wide_rebase_node(slug, url):
     host = urlparse(url).hostname
     if not host:
         return url
+    if host.startswith('ds') and not _wide_host_resolves(host):
+        # The cached node name has stopped resolving outright (ds164 -> ds167 ->
+        # ds168 all vanished within days). No in-memory reference can help here,
+        # because Kodi restarts the interpreter between menu entries, so flag it
+        # and let the caller re-resolve through the portal.
+        _wide_note_node(slug, '')
+        log(f'[WideIptv] cached node {host} no longer resolves for {slug}')
+        return ''
     known = _wide_current_node(slug)
     if known == host:
         return url
     if known is None or not known.startswith('ds') or not host.startswith('ds'):
-        # No live reference for this slug: either we have none yet, or the stored
-        # URL is not a wideiptv node, so leave it alone rather than guess.
         _wide_note_node(slug, host)
         return url
     # host is the one baked into the cached URL; known is what the site serves now.
@@ -5973,9 +5995,10 @@ def get_wideiptv_url(channel_id):
             fresh = _wide_fresh_token(slug, cached_token)
             # Rebuild with the fresh token; the stored URL's own token is long dead.
             base_url = _wide_rebase_node(slug, base_url)
-            rebuilt = _wide_freshen_url(base_url, slug) if base_url else ''
-            log(f'[WideIptv] OK ({channel_id}): slug={slug} (cached, no portal request)')
-            return rebuilt, slug, fresh
+            if base_url:
+                log(f'[WideIptv] OK ({channel_id}): slug={slug} (cached, no portal request)')
+                return _wide_freshen_url(base_url, slug), slug, fresh
+            log(f'[WideIptv] cached node for {slug} is gone, re-resolving through the portal')
 
         watch_url = abs_url(f'watch.php?id={channel_id}')
         player_page = abs_url(f'player/stream-{channel_id}.php')
