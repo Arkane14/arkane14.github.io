@@ -1,4 +1,4 @@
-# version: 1.2.30 (doit correspond à addon.xml)
+# version: 1.2.31 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -137,6 +137,7 @@ _M3U8_ENDLIST = b'#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-END
 _SEQ_RX = re.compile(r'#EXT-X-MEDIA-SEQUENCE:(\d+)')
 _FAV_PROBE_TS_FILE = os.path.join(_KODI_TEMP, 'dltv_fav_probe_ts')
 _PAGE_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_page_cache.json')
+_FAILED_KEY = '__failed_urls'   # failure marks live in the same file, separate key
 
 
 def _aes128_cbc_decrypt(data, key, iv):
@@ -3323,12 +3324,66 @@ def _save_page_cache(cache):
     except Exception as e:
         log(f"[fetch_via_proxy] Failed to save page cache: {e}")
 
-_fetch_failed = {}             # url -> timestamp of the last failed fetch
+_fetch_failed = {}             # url -> timestamp, mirrored to disk on every failure
 _fetch_fail_lock = threading.Lock()
 _FETCH_FAIL_TTL = 60          # seconds to stop retrying a URL that just failed
 
 
+def _load_failed_urls():
+    """Read the failure marks written by a previous Kodi invocation.
+
+    Kodi starts a fresh Python interpreter for every directory build, so anything
+    kept in a module-level dict is empty again by the next menu entry — which is why
+    an in-memory failure cache could never suppress the retry storm this marks.
+    On disk, next to the page cache it shares, it survives."""
+    try:
+        with open(_PAGE_CACHE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        marks = data.get(_FAILED_KEY) if isinstance(data, dict) else None
+    except Exception:
+        return {}
+    now = time.time()
+    out = {}
+    if isinstance(marks, dict):
+        for u, ts in marks.items():
+            try:
+                if now - float(ts) < _FETCH_FAIL_TTL:
+                    out[u] = float(ts)
+            except Exception:
+                continue
+    return out
+
+
+def _save_failed_urls(marks):
+    """Persist the failure marks without disturbing the cached pages."""
+    try:
+        with _fetch_fail_lock:
+            snapshot = {u: v for u, v in marks.items() if time.time() - v < _FETCH_FAIL_TTL}
+        try:
+            with open(_PAGE_CACHE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data[_FAILED_KEY] = snapshot
+        _dir = os.path.dirname(_PAGE_CACHE_FILE)
+        fd, tmp_path = tempfile.mkstemp(dir=_dir)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(data, f)
+            os.replace(tmp_path, _PAGE_CACHE_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except Exception as e:
+        log(f'[fetch_via_proxy] failed-mark save skipped: {type(e).__name__}')
+
+
 def fetch_via_proxy(url, headers=None, use_cache=True):
+    global _fetch_failed
     headers = headers or {}
     should_cache = should_cache_url(url)
 
@@ -3346,6 +3401,9 @@ def fetch_via_proxy(url, headers=None, use_cache=True):
     # cache and forces a rebuild, so the menu spins for minutes. Serving the last
     # good page (or nothing) for a minute is better than blocking the UI.
     _fail_ts = _fetch_failed.get(url)
+    if _fail_ts is None:
+        _fetch_failed = _load_failed_urls()
+        _fail_ts = _fetch_failed.get(url)
     if _fail_ts and time.time() - _fail_ts < _FETCH_FAIL_TTL:
         _stale = ''
         if should_cache:
@@ -3375,12 +3433,13 @@ def fetch_via_proxy(url, headers=None, use_cache=True):
         if attempt == 0:
             time.sleep(1)
     if _is_error_response(resp_text, url):
-        with _fetch_fail_lock:
-            _fetch_failed[url] = time.time()
+        _marks = dict(_fetch_failed)
+        _marks[url] = time.time()
+        _save_failed_urls(_marks)
         return ''
 
-    with _fetch_fail_lock:
-        _fetch_failed.pop(url, None)
+    if url in _fetch_failed:
+        _save_failed_urls({k: v for k, v in _fetch_failed.items() if k != url})
     if should_cache:
         cached = _load_page_cache()
         cached[url] = {'timestamp': int(time.time()), 'data': resp_text}
