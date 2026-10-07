@@ -1,4 +1,4 @@
-# version: 1.2.31 (doit correspond à addon.xml)
+# version: 1.2.32 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -547,6 +547,13 @@ _wide_seg_queued = set()        # seg_key currently being prefetched
 _wide_slug_cache = {}           # channel id -> {slug, url, token, ts}
 _wide_slug_lock = threading.Lock()
 _wide_slug_absent = {}          # slug -> timestamp, CDN has no content for it
+# The CDN host is the part that changes: ds164 -> ds167 -> ds168 over three days,
+# while the slug never moves. Remember the current host per slug so a cached entry
+# keeps working across a node rotation instead of pinning a name that no longer
+# resolves for the rest of the 24 h TTL.
+_wide_node = {}                 # slug -> current CDN host
+_wide_node_lock = threading.Lock()
+_WIDE_NODE_TTL = 900            # re-check the advertised node every 15 min
 # Attempts per upstream poll. The wideiptv CDN nodes refuse about half the
 # connections they receive, so the retry count — not the timeout — is what decides
 # whether a manifest or segment gets through.
@@ -5913,6 +5920,41 @@ def _wide_slug_is_absent(slug):
     return bool(ts) and time.time() - ts < _WIDE_SLUG_ABSENT_TTL
 
 
+def _wide_note_node(slug, host):
+    with _wide_node_lock:
+        _wide_node[slug] = (host, time.time())
+
+
+def _wide_current_node(slug):
+    with _wide_node_lock:
+        entry = _wide_node.get(slug)
+    if entry and time.time() - entry[1] < _WIDE_NODE_TTL:
+        return entry[0]
+    return None
+
+
+def _wide_rebase_node(slug, url):
+    """Point a cached URL at the CDN host the site is currently advertising."""
+    if not url:
+        return url
+    host = urlparse(url).hostname
+    if not host:
+        return url
+    known = _wide_current_node(slug)
+    if known == host:
+        return url
+    if known is None or not known.startswith('ds') or not host.startswith('ds'):
+        # No live reference for this slug: either we have none yet, or the stored
+        # URL is not a wideiptv node, so leave it alone rather than guess.
+        _wide_note_node(slug, host)
+        return url
+    # host is the one baked into the cached URL; known is what the site serves now.
+    rebased = url.replace(f'//{host}/', f'//{known}/', 1)
+    log(f'[WideIptv] CDN node for {slug} moved {host} → {known}, rebasing cached URL')
+    _wide_note_node(slug, known)
+    return rebased
+
+
 def get_wideiptv_url(channel_id):
     """Player 6 (wideiptv.top) backend: walk stream-{id}.php → daddy.php?stream=SLUG →
     player page, extract the HLS streamUrl + channel slug + token.
@@ -5930,6 +5972,7 @@ def get_wideiptv_url(channel_id):
                 return None
             fresh = _wide_fresh_token(slug, cached_token)
             # Rebuild with the fresh token; the stored URL's own token is long dead.
+            base_url = _wide_rebase_node(slug, base_url)
             rebuilt = _wide_freshen_url(base_url, slug) if base_url else ''
             log(f'[WideIptv] OK ({channel_id}): slug={slug} (cached, no portal request)')
             return rebuilt, slug, fresh
@@ -5969,6 +6012,7 @@ def get_wideiptv_url(channel_id):
         ms = re.search(r'channelSlug:\s*"([^"]+)"', r3.text)
         slug = ms.group(1) if ms else stream_url.rsplit('/', 2)[-2]
         log(f'[WideIptv] OK ({channel_id}): {stream_url[:90]} slug={slug}')
+        _wide_note_node(slug, urlparse(stream_url).hostname or '')
         _wide_slug_store(channel_id, slug, stream_url, token)
         # Prove the manifest exists before handing the URL over. A 404 here means the
         # site advertises the slug while the CDN holds no content for it, which is a
