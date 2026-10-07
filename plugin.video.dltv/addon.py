@@ -1,4 +1,4 @@
-# version: 1.2.34 (doit correspond à addon.xml)
+# version: 1.2.35 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -559,6 +559,8 @@ _wide_node_lock = threading.Lock()
 # what stops working once the portal starts refusing connections.
 _wide_node_global = None        # (host, timestamp)
 _WIDE_NODE_TTL = 900            # re-check the advertised node every 15 min
+_WIDE_NODE_KEY = '__node'        # key holding the advertised node in the slug file
+_wide_node_bootstrap_done = False
 # Attempts per upstream poll. The wideiptv CDN nodes refuse about half the
 # connections they receive, so the retry count — not the timeout — is what decides
 # whether a manifest or segment gets through.
@@ -5831,6 +5833,12 @@ def _save_wide_slug_cache():
         snapshot = {k: {'slug': v['slug'], 'ts': v['ts'], 'url': v.get('url', ''),
                         'token': v.get('token', '')} for k, v in _wide_slug_cache.items()}
     try:
+        # The slug cache shares its file with the advertised CDN node, so carry the
+        # node through: writing only the slugs here would wipe it, and the next
+        # session would have no node to rebase the slugs against.
+        _node = _wide_node_file_read()
+        if _node:
+            snapshot[_WIDE_NODE_KEY] = _node
         _dir = os.path.dirname(_WIDE_SLUG_FILE)
         fd, tmp_path = tempfile.mkstemp(dir=_dir)
         try:
@@ -5856,11 +5864,65 @@ def _wide_slug_cached(channel_id):
     return entry['slug'], entry.get('url', ''), entry.get('token', '')
 
 
+def _wide_node_file_read():
+    """Read the advertised CDN node from the slug cache file."""
+    try:
+        with open(_WIDE_SLUG_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    host = data.get(_WIDE_NODE_KEY) if isinstance(data, dict) else None
+    return host if isinstance(host, str) and host else None
+
+
+def _wide_node_file_write(host):
+    """Persist the advertised CDN node next to the slug cache.
+
+    Kodi restarts the interpreter between menu entries, so an in-memory node is lost
+    exactly when it is needed most: a session that starts while the portal is
+    refusing cannot repair a slug whose cached node has just been retired."""
+    try:
+        try:
+            with open(_WIDE_SLUG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data[_WIDE_NODE_KEY] = host
+        _dir = os.path.dirname(_WIDE_SLUG_FILE)
+        fd, tmp_path = tempfile.mkstemp(dir=_dir)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(data, f)
+            os.replace(tmp_path, _WIDE_SLUG_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except Exception as e:
+        log(f'[WideIptv] node save failed: {type(e).__name__}')
+
+
 def _wide_slug_store(channel_id, slug, stream_url, token):
     with _wide_slug_lock:
         _wide_slug_cache[str(channel_id)] = {'slug': slug, 'ts': time.time(),
                                              'url': stream_url, 'token': token}
     _save_wide_slug_cache()
+
+
+def _wide_node_bootstrap():
+    """Load the persisted node once, on first use."""
+    global _wide_node_bootstrap_done, _wide_node_global
+    if _wide_node_bootstrap_done:
+        return
+    _wide_node_bootstrap_done = True
+    host = _wide_node_file_read()
+    if host:
+        with _wide_node_lock:
+            _wide_node_global = (host, time.time())
+        log(f'[WideIptv] CDN node from cache: {host}')
 
 
 def _load_wide_absent():
@@ -5928,12 +5990,16 @@ def _wide_slug_is_absent(slug):
 def _wide_note_node(slug, host):
     global _wide_node_global
     with _wide_node_lock:
+        prev = _wide_node_global
         _wide_node[slug] = (host, time.time())
         if host and host.startswith('ds'):
             _wide_node_global = (host, time.time())
+    if host and host.startswith('ds') and (prev is None or prev[0] != host):
+        _wide_node_file_write(host)
 
 
 def _wide_current_node(slug):
+    _wide_node_bootstrap()
     with _wide_node_lock:
         entry = _wide_node.get(slug)
     if entry and time.time() - entry[1] < _WIDE_NODE_TTL:
@@ -5961,30 +6027,30 @@ def _wide_rebase_node(slug, url):
     """Point a cached URL at the CDN host the site is currently advertising."""
     if not url:
         return url
+    _wide_node_bootstrap()
     host = urlparse(url).hostname
     if not host:
         return url
+    with _wide_node_lock:
+        glob = _wide_node_global
+    if glob and glob[0] != host and glob[0].startswith('ds') and _wide_host_resolves(glob[0]):
+        # One node serves every slug, so a node learned for any channel — including
+        # one persisted from an earlier session — repairs this one for free.
+        rebased = url.replace(f'//{host}/', f'//{glob[0]}/', 1)
+        log(f'[WideIptv] CDN node for {slug} moved {host} → {glob[0]} '
+            f'(node learned from another channel), rebasing cached URL')
+        _wide_note_node(slug, glob[0])
+        return rebased
     if host.startswith('ds') and not _wide_host_resolves(host):
         # The cached node name has stopped resolving outright (ds164 -> ds167 ->
-        # ds168 all vanished within days). No in-memory reference can help here,
-        # because Kodi restarts the interpreter between menu entries, so flag it
-        # and let the caller re-resolve through the portal.
+        # ds168 all vanished within days). With no other node known, the caller has
+        # to re-resolve through the portal.
         _wide_note_node(slug, '')
         log(f'[WideIptv] cached node {host} no longer resolves for {slug}')
         return ''
     known = _wide_current_node(slug)
     if known == host:
         return url
-    # A node learned for any slug applies to all of them.
-    with _wide_node_lock:
-        glob = _wide_node_global
-    if glob and time.time() - glob[1] < _WIDE_NODE_TTL and glob[0] != host and glob[0].startswith('ds'):
-        if host.startswith('ds') and _wide_host_resolves(glob[0]):
-            rebased = url.replace(f'//{host}/', f'//{glob[0]}/', 1)
-            log(f'[WideIptv] CDN node for {slug} moved {host} → {glob[0]} '
-                f'(node learned from another channel), rebasing cached URL')
-            _wide_note_node(slug, glob[0])
-            return rebased
     if known is None or not known.startswith('ds') or not host.startswith('ds'):
         _wide_note_node(slug, host)
         return url
