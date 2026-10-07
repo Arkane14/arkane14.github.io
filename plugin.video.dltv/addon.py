@@ -1,4 +1,4 @@
-# version: 1.2.28 (doit correspond à addon.xml)
+# version: 1.2.29 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -3280,6 +3280,11 @@ def _save_page_cache(cache):
     except Exception as e:
         log(f"[fetch_via_proxy] Failed to save page cache: {e}")
 
+_fetch_failed = {}             # url -> timestamp of the last failed fetch
+_fetch_fail_lock = threading.Lock()
+_FETCH_FAIL_TTL = 60          # seconds to stop retrying a URL that just failed
+
+
 def fetch_via_proxy(url, headers=None, use_cache=True):
     headers = headers or {}
     should_cache = should_cache_url(url)
@@ -3291,6 +3296,22 @@ def fetch_via_proxy(url, headers=None, use_cache=True):
             if time.time() - entry['timestamp'] < get_cache_expiry() and not _is_error_response(entry['data'], url):
                 log(f"[fetch_via_proxy] Returning cached data for {url}")
                 return entry['data']
+
+    # Remember failures too. Without this, a portal that refuses connections makes
+    # every directory rebuild retry each URL from scratch — 4 requests plus a
+    # get_active_base probe each, ~8s per URL — and "Update schedule" clears the
+    # cache and forces a rebuild, so the menu spins for minutes. Serving the last
+    # good page (or nothing) for a minute is better than blocking the UI.
+    _fail_ts = _fetch_failed.get(url)
+    if _fail_ts and time.time() - _fail_ts < _FETCH_FAIL_TTL:
+        _stale = ''
+        if should_cache:
+            _e = _load_page_cache().get(url)
+            if isinstance(_e, dict):
+                _stale = _e.get('data', '') or ''
+        log(f"[fetch_via_proxy] {url[:60]} unreachable {int(time.time() - _fail_ts)}s ago, "
+            f"{'serving stale cache' if _stale else 'skipping request'}")
+        return _stale
 
     resp_text = ''
     for attempt in range(2):
@@ -3311,8 +3332,12 @@ def fetch_via_proxy(url, headers=None, use_cache=True):
         if attempt == 0:
             time.sleep(1)
     if _is_error_response(resp_text, url):
+        with _fetch_fail_lock:
+            _fetch_failed[url] = time.time()
         return ''
 
+    with _fetch_fail_lock:
+        _fetch_failed.pop(url, None)
     if should_cache:
         cached = _load_page_cache()
         cached[url] = {'timestamp': int(time.time()), 'data': resp_text}
@@ -3333,11 +3358,23 @@ def normalize_origin(url):
         return SEED_BASEURL
 
 _active_base_cache = None
+_active_base_failed_at = 0
+_ACTIVE_BASE_FAIL_TTL = 30   # seconds before re-probing a portal that just refused
+
 
 def get_active_base():
-    global _active_base_cache
+    global _active_base_cache, _active_base_failed_at
     if _active_base_cache:
         return _active_base_cache
+    # A portal that just refused connections must not be re-probed on every single
+    # call: a directory rebuild asks for the base once per URL, and each probe costs
+    # a full timeout. Remember the failure briefly and reuse the fallback instead.
+    if _active_base_failed_at and time.time() - _active_base_failed_at < _ACTIVE_BASE_FAIL_TTL:
+        base = normalize_origin(SEED_BASEURL)
+        if not base.endswith('/'):
+            base += '/'
+        _active_base_cache = base
+        return base
     base = addon.getSetting('active_baseurl')
     if base:
         # Validate once per process — if unreachable, fall back to seed
@@ -3349,6 +3386,7 @@ def get_active_base():
         except Exception as e:
             log(f'[get_active_base] {base} invalide ({e}), reset vers seed')
             base = ''
+            _active_base_failed_at = time.time()
             addon.setSetting('active_baseurl', '')
     if not base:
         base = normalize_origin(SEED_BASEURL)
