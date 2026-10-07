@@ -1,4 +1,4 @@
-# version: 1.2.33 (doit correspond à addon.xml)
+# version: 1.2.34 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -551,8 +551,13 @@ _wide_slug_absent = {}          # slug -> timestamp, CDN has no content for it
 # while the slug never moves. Remember the current host per slug so a cached entry
 # keeps working across a node rotation instead of pinning a name that no longer
 # resolves for the rest of the 24 h TTL.
-_wide_node = {}                 # slug -> current CDN host
+_wide_node = {}                 # slug -> (host, timestamp)
 _wide_node_lock = threading.Lock()
+# One node serves every slug, so one successful resolution says which node the site
+# is on for all of them. Without this, repairing a single channel leaves the others
+# pinned to the dead node, and each of them then needs a portal request — exactly
+# what stops working once the portal starts refusing connections.
+_wide_node_global = None        # (host, timestamp)
 _WIDE_NODE_TTL = 900            # re-check the advertised node every 15 min
 # Attempts per upstream poll. The wideiptv CDN nodes refuse about half the
 # connections they receive, so the retry count — not the timeout — is what decides
@@ -5921,8 +5926,11 @@ def _wide_slug_is_absent(slug):
 
 
 def _wide_note_node(slug, host):
+    global _wide_node_global
     with _wide_node_lock:
         _wide_node[slug] = (host, time.time())
+        if host and host.startswith('ds'):
+            _wide_node_global = (host, time.time())
 
 
 def _wide_current_node(slug):
@@ -5967,6 +5975,16 @@ def _wide_rebase_node(slug, url):
     known = _wide_current_node(slug)
     if known == host:
         return url
+    # A node learned for any slug applies to all of them.
+    with _wide_node_lock:
+        glob = _wide_node_global
+    if glob and time.time() - glob[1] < _WIDE_NODE_TTL and glob[0] != host and glob[0].startswith('ds'):
+        if host.startswith('ds') and _wide_host_resolves(glob[0]):
+            rebased = url.replace(f'//{host}/', f'//{glob[0]}/', 1)
+            log(f'[WideIptv] CDN node for {slug} moved {host} → {glob[0]} '
+                f'(node learned from another channel), rebasing cached URL')
+            _wide_note_node(slug, glob[0])
+            return rebased
     if known is None or not known.startswith('ds') or not host.startswith('ds'):
         _wide_note_node(slug, host)
         return url
