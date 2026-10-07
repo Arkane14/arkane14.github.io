@@ -1,4 +1,4 @@
-# version: 1.2.26 (doit correspond à addon.xml)
+# version: 1.2.27 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -1338,6 +1338,23 @@ def _unwrap_ptv_segment(body):
     return ts
 
 
+def _proxy_headers(origin):
+    """Build the Origin/Referer pair the premiumtv CDN expects.
+
+    `origin` arrives as the page URL the addon was invoked from, query string
+    included. Sending that whole string in Origin makes the header syntactically
+    invalid and the CDN answers 403 to every manifest — measured on the live CDN:
+    the same URL returns 200 with no Origin at all, and 200 with Origin set to
+    the bare site root, but 403 with Origin set to the full page URL. Origin must
+    be scheme + host only.
+    """
+    parsed = urlparse(origin)
+    root = f'{parsed.scheme}://{parsed.netloc}' if parsed.scheme and parsed.netloc else origin
+    referer = origin if '?' in origin else origin.rstrip('/') + '/'
+    return {'User-Agent': UA, 'Origin': root, 'Referer': referer}
+
+
+
 class _EPlayerProxyHandler(BaseHTTPRequestHandler):
     """Local HTTP proxy that:
     - GET /m3u8/<channel_key>  → fetches live m3u8, rewrites key URIs to /key/...
@@ -2438,8 +2455,8 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
-            referer = origin.rstrip('/') + '/'
-            hdrs = {'User-Agent': UA, 'Origin': origin, 'Referer': referer}
+            hdrs = _proxy_headers(origin)
+            referer = hdrs['Referer']
 
             # Fetch without streaming so we can inspect Content-Type / content prefix
             r = requests.get(raw_url, headers=hdrs, timeout=5)
@@ -2517,8 +2534,8 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
-            referer = origin.rstrip('/') + '/'
-            hdrs = {'User-Agent': UA, 'Origin': origin, 'Referer': referer}
+            hdrs = _proxy_headers(origin)
+            referer = hdrs['Referer']
 
             r = requests.get(raw_url, headers=hdrs, timeout=8)
             if r.status_code != 200:
@@ -5974,6 +5991,10 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
             m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/ptv/{encoded_origin}/{encoded_url}'
             log(f'[PlayStream] Using fallback premiumtv HLS via ptv proxy: {m3u8_url}')
             _premiumtv_hls = True
+            # player_origin doubles as "which backend actually served this": the
+            # cascade labels a success with the backend it was trying, so without
+            # this a premiumtv fallback was logged as a wideiptv success.
+            player_origin = 'premiumtv'
         else:
             encoded_slug = quote_plus(w_slug)
             encoded_url = quote_plus(w_url)
@@ -6105,7 +6126,13 @@ def PlayStream(link):
             _res = _resolve_playback(channel_id, channel_key, _cdn)
             if _res:
                 m3u8_url, _premiumtv_hls, use_player6, player_origin = _res
-                log(f'[PlayStream] backend OK: {_label}')
+                # A backend may serve the stream through another one — wideiptv
+                # falls back to premiumtv when its CDN is down. Report what
+                # actually produced the URL, not what the cascade was attempting.
+                _served = _label
+                if player_origin == 'premiumtv':
+                    _served = 'Direct HLS (premiumtv, fallback depuis wideiptv)'
+                log(f'[PlayStream] backend OK: {_served}')
                 break
         if not m3u8_url:
             log(f'[PlayStream] every backend failed for {channel_key} — offering manual list')
