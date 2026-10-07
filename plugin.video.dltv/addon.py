@@ -1,4 +1,4 @@
-# version: 1.2.25 (doit correspond à addon.xml)
+# version: 1.2.26 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -2477,12 +2477,17 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 if body[:2] == b'\x89P':
                     # premiumtv ships its TS inside a PNG envelope; hand adaptive
                     # the real transport stream instead of the wrapper.
+                    _t0 = time.time()
                     ts = _unwrap_ptv_segment(body)
+                    _ms = (time.time() - _t0) * 1000
                     if ts:
                         log(f'[PremiumTVProxy] unwrapped PNG envelope '
-                            f'{len(body)}B -> MPEG-TS {len(ts)}B')
+                            f'{len(body)}B -> MPEG-TS {len(ts)}B in {_ms:.0f} ms')
                         body = ts
                         ct_out = 'video/MP2T'
+                    else:
+                        log(f'[PremiumTVProxy] PNG envelope not unwrapped '
+                            f'({len(body)}B) after {_ms:.0f} ms')
                 self.send_response(r.status_code)
                 self.send_header('Content-Type', ct_out)
                 self.send_header('Content-Length', str(len(body)))
