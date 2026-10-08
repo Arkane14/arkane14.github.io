@@ -1,4 +1,4 @@
-# version: 1.2.40 (doit correspond à addon.xml)
+# version: 1.2.41 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -41,6 +41,33 @@ import xbmcplugin
 import xbmcaddon
 
 _KODI_TEMP = xbmcvfs.translatePath('special://temp/')
+
+# Kodi's setSetting() re-reads and rewrites the whole settings.xml on every single call
+# and does not serialise it: two threads writing at the same time leave a file that can
+# no longer be parsed, or a zero-length file if Kodi exits mid-write. Both happened here
+# (CAddon[plugin.video.dltv]: failed to load addon settings) and the add-on's own
+# settings are not the place to keep anything that must not be lost. Every write goes
+# through _set_setting() from now on.
+_SETTINGS_LOCK = threading.RLock()
+_FAV_FILE = os.path.join(_KODI_TEMP, 'dltv_favorites.json')
+_EXTRA_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_extra_channels.json')
+
+
+def _write_file(path, text):
+    """Atomic write: Kodi and Windows both truncate on open, so a crash mid-write
+    would leave an empty file — exactly what happened to settings.xml."""
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def _set_setting(key, value):
+    with _SETTINGS_LOCK:
+        try:
+            addon.setSetting(key, value)
+        except Exception as e:
+            log(f'[settings] cannot write {key}: {type(e).__name__} {e}')
 os.makedirs(_KODI_TEMP, exist_ok=True)
 
 addon_url = sys.argv[0]
@@ -1180,14 +1207,14 @@ def _discover_server_urls():
         if chevy_proxy:
             CHEVY_PROXY = chevy_proxy
             CHEVY_LOOKUP = effective_lookup
-            addon.setSetting('chevy_proxy_url', chevy_proxy)
-            addon.setSetting('chevy_lookup_url', effective_lookup)
-            addon.setSetting('ksohls_base_url', ksohls_base)
+            _set_setting('chevy_proxy_url', chevy_proxy)
+            _set_setting('chevy_lookup_url', effective_lookup)
+            _set_setting('ksohls_base_url', ksohls_base)
             log(f'[Discovery] Updated: proxy={chevy_proxy} lookup={effective_lookup} ksohls={ksohls_base}')
         else:
-            addon.setSetting('ksohls_base_url', ksohls_base)
+            _set_setting('ksohls_base_url', ksohls_base)
             if effective_lookup:
-                addon.setSetting('chevy_lookup_url', effective_lookup)
+                _set_setting('chevy_lookup_url', effective_lookup)
             log(f'[Discovery] Updated ksohls only (page has no literal proxy URL): ksohls={ksohls_base}')
 
     except Exception as e:
@@ -3503,10 +3530,10 @@ def get_active_base():
             log(f'[get_active_base] {base} invalide ({e}), reset vers seed')
             base = ''
             _active_base_failed_at = time.time()
-            addon.setSetting('active_baseurl', '')
+            _set_setting('active_baseurl', '')
     if not base:
         base = normalize_origin(SEED_BASEURL)
-        addon.setSetting('active_baseurl', base)
+        _set_setting('active_baseurl', base)
     if not base.endswith('/'):
         base += '/'
     _active_base_cache = base
@@ -4017,13 +4044,31 @@ def getSource(trData):
         log(f'getSource failed: {e}')
 
 def get_favorites():
+    favs = []
     try:
-        return json.loads(addon.getSetting('favorites') or '[]')
-    except Exception:
+        favs = json.loads(addon.getSetting('favorites') or '[]')
+    except ValueError:
+        favs = []
+    if favs:
+        return favs
+    # settings.xml unreadable or wiped — restore from our own durable copy
+    try:
+        with open(_FAV_FILE, encoding='utf-8') as fh:
+            favs = json.load(fh)
+    except (OSError, ValueError):
         return []
+    if favs:
+        log(f'[favorites] restored {len(favs)} from {os.path.basename(_FAV_FILE)}')
+        _set_setting('favorites', json.dumps(favs))
+    return favs
+
 
 def save_favorites(favs):
-    addon.setSetting('favorites', json.dumps(favs))
+    try:
+        _write_file(_FAV_FILE, json.dumps(favs))
+    except OSError as e:
+        log(f'[favorites] durable copy not written: {e}')
+    _set_setting('favorites', json.dumps(favs))
 
 def toggle_favorite(cid, name):
     favs = get_favorites()
@@ -6715,7 +6760,12 @@ def load_extra_channels(force_reload=False):
     global EXTRA_CHANNELS_DATA
     _LOCAL_CACHE_EXPIRY = 24 * 60 * 60  # L5: renamed from CACHE_EXPIRY to avoid shadowing module-level name
 
-    saved = addon.getSetting('extra_channels_cache')
+    saved = None
+    try:
+        with open(_EXTRA_CACHE_FILE, encoding='utf-8') as fh:
+            saved = fh.read()
+    except OSError:
+        saved = None
     if saved and not force_reload:
         try:
             saved_data = json.loads(saved)
@@ -6773,10 +6823,11 @@ def load_extra_channels(force_reload=False):
 
     EXTRA_CHANNELS_DATA = categories
 
-    addon.setSetting(
-        'extra_channels_cache',
-        json.dumps({'timestamp': int(time.time()), 'channels': EXTRA_CHANNELS_DATA})
-    )
+    try:
+        _write_file(_EXTRA_CACHE_FILE,
+                    json.dumps({'timestamp': int(time.time()), 'channels': EXTRA_CHANNELS_DATA}))
+    except OSError as e:
+        log(f'[settings] extra channels cache not written: {e}')
 
     return EXTRA_CHANNELS_DATA
 
@@ -6971,9 +7022,9 @@ try:
                     PLAYER_REFERER = _KSOHLS_BASE + '/'
                     _SEG_HEADERS['Origin'] = _KSOHLS_BASE
                     _SEG_HEADERS['Referer'] = PLAYER_REFERER
-                    addon.setSetting('chevy_proxy_url', CHEVY_PROXY)
-                    addon.setSetting('chevy_lookup_url', CHEVY_LOOKUP)
-                    addon.setSetting('ksohls_base_url', _KSOHLS_BASE)
+                    _set_setting('chevy_proxy_url', CHEVY_PROXY)
+                    _set_setting('chevy_lookup_url', CHEVY_LOOKUP)
+                    _set_setting('ksohls_base_url', _KSOHLS_BASE)
                     _disco_fresh = True
                     log(f'[Discovery] Cache OK: ksohls={_KSOHLS_BASE} proxy={CHEVY_PROXY}')
                 else:
@@ -6985,8 +7036,8 @@ try:
                     # Reset globals and addon settings to builtin defaults
                     CHEVY_PROXY = _CHEVY_PROXY_BUILTIN
                     CHEVY_LOOKUP = _CHEVY_LOOKUP_BUILTIN
-                    addon.setSetting('chevy_proxy_url', '')
-                    addon.setSetting('chevy_lookup_url', '')
+                    _set_setting('chevy_proxy_url', '')
+                    _set_setting('chevy_lookup_url', '')
     if not _disco_fresh:
         threading.Thread(target=_discover_server_urls, daemon=True).start()
 except Exception as _e:
