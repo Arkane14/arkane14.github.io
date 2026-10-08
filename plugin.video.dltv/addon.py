@@ -1,4 +1,4 @@
-# version: 1.2.37 (doit correspond à addon.xml)
+# version: 1.2.38 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -5146,33 +5146,40 @@ def _try_player_page(channel_id, player_url, watch_url, sess):
                 ri = sess.get(iframe_url, headers={'User-Agent': UA, 'Referer': player_url}, timeout=8)
                 if ri.status_code != 200:
                     continue
-                # ── ligue1live.xyz: wrapper page with nested iframe ──────────────
-                if 'ligue1live.xyz' in iframe_url:
-                    _ll_inner_m = re.search(r'<iframe\s[^>]*src=["\']([^"\']+)["\']', ri.text)
-                    if _ll_inner_m:
-                        _ll_inner_url = _ll_inner_m.group(1)
-                        log(f'[AnyPlayer] ligue1live nested iframe: {_ll_inner_url[:80]}')
+                # ── Nested iframe: many players wrap the real player one level
+                #    deeper than the page we were pointed at. wikisport.{info,wiki,club}
+                #    -> xstream.st/fslivepro.php -> instreams.{live,pro,online} is the
+                #    case that matters here (channels whose catalog entry has no name,
+                #    e.g. 1507 / 1668 / 1088 / 1670). Previously this only existed for
+                #    ligue1live.xyz, so every other wrapper was silently dropped.
+                for _nin in [m.group(1) for m in _AP_IFRAME_RX.finditer(ri.text)]:
+                    if any(skip in _nin for skip in _AP_SKIP_HOSTS) or _nin == iframe_url:
+                        continue
+                    try:
+                        _nr = sess.get(_nin, headers={'User-Agent': UA, 'Referer': iframe_url}, timeout=8)
+                    except Exception as _ne:
+                        log(f'[AnyPlayer] nested iframe error: {_nin[:60]} ({type(_ne).__name__})')
+                        continue
+                    if _nr.status_code != 200:
+                        continue
+                    log(f'[AnyPlayer] nested iframe: {_nin[:80]}')
+                    for _nmi in _AP_M3U8_RX.finditer(_nr.text):
+                        _ncand = _ap_clean_url(_nmi.group(1))
+                        if 'blogspot.com' in _ncand or 'r-strm.' in _ncand:
+                            continue
                         try:
-                            _ll_r = sess.get(_ll_inner_url, headers={'User-Agent': UA, 'Referer': iframe_url}, timeout=8)
-                            if _ll_r.status_code == 200:
-                                for _ll_mi in _AP_M3U8_RX.finditer(_ll_r.text):
-                                    _ll_cand = _ll_mi.group(1)
-                                    try:
-                                        _ll_rp = sess.get(_ll_cand, headers={'User-Agent': UA}, timeout=4)
-                                        if _ll_rp.status_code == 200 and '#EXTM3U' in _ll_rp.text[:200]:
-                                            log(f'[AnyPlayer] ligue1live m3u8 OK: {_ll_cand[:80]}')
-                                            return (_ll_cand, None)
-                                    except Exception:
-                                        pass
-                                _ll_su = _AP_STREAM_URL_RX.search(_ll_r.text)
-                                if _ll_su:
-                                    _ll_url = _ll_su.group(1).replace('\\/', '/')
-                                    log(f'[AnyPlayer] ligue1live streamUrl: {_ll_url[:80]}')
-                                    return (_ll_url, None)
-                            else:
-                                log(f'[AnyPlayer] ligue1live inner HTTP {_ll_r.status_code}')
-                        except Exception as _ll_e:
-                            log(f'[AnyPlayer] ligue1live inner error: {_ll_e}')
+                            _nrp = sess.get(_ncand, headers={'User-Agent': UA}, timeout=4)
+                        except Exception:
+                            continue
+                        if _nrp.status_code == 200 and '#EXTM3U' in _nrp.text[:200]:
+                            log(f'[AnyPlayer] nested m3u8 OK: {_ncand[:80]}')
+                            return (_ncand, None)
+                    _nsu = _AP_STREAM_URL_RX.search(_nr.text)
+                    if _nsu:
+                        _nurl = _ap_clean_url(_nsu.group(1))
+                        log(f'[AnyPlayer] nested streamUrl: {_nurl[:80]}')
+                        return (_nurl, None)
+
                 for mi in _AP_M3U8_RX.finditer(ri.text):
                     candidate = _ap_clean_url(mi.group(1))
                     if 'blogspot.com' in candidate or 'r-strm.' in candidate:
