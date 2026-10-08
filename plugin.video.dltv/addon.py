@@ -1,4 +1,4 @@
-# version: 1.2.39 (doit correspond à addon.xml)
+# version: 1.2.40 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -5818,6 +5818,33 @@ def _upstream_alive(url, referer=None, timeout=6):
     return True
 
 
+_cdn_health = {}                # host -> (reachable: bool, timestamp)
+_cdn_health_lock = threading.Lock()
+# A node that refuses connections stays dead for the whole outage, but the probe was
+# being repeated for every channel: measured 6 consecutive probes over 252 s on one
+# outage, each costing ~17 s before the fallback. One verdict per host per window is
+# enough — the node does not come back mid-zap.
+_CDN_HEALTH_TTL = 60
+
+
+def _cdn_verdict(host):
+    """Recent probe result for a host, or None when it must be probed."""
+    if not host:
+        return None
+    with _cdn_health_lock:
+        entry = _cdn_health.get(host)
+    if entry and time.time() - entry[1] < _CDN_HEALTH_TTL:
+        return entry[0]
+    return None
+
+
+def _cdn_record(host, ok):
+    if not host:
+        return
+    with _cdn_health_lock:
+        _cdn_health[host] = (ok, time.time())
+
+
 def _cdn_reachable(url, referer=None, timeout=6, attempts=1):
     """Probe a CDN manifest: True only when it answers 200 with a real HLS playlist.
 
@@ -5825,6 +5852,12 @@ def _cdn_reachable(url, referer=None, timeout=6, attempts=1):
     perfectly good HLS when they answer, so connection-level failures are retried while
     an HTTP verdict (403/404/not-a-playlist) is returned immediately — retrying that
     would only waste the delay before falling through to the next backend."""
+    host = urlparse(url).hostname or ''
+    known = _cdn_verdict(host)
+    if known is not None:
+        log(f'[CDNProbe] {host} known {"up" if known else "down"} from the last '
+            f'{int(time.time() - _cdn_health[host][1])}s — no probe')
+        return known
     hdrs = {'User-Agent': UA}
     if referer:
         hdrs['Referer'] = referer
@@ -5837,14 +5870,19 @@ def _cdn_reachable(url, referer=None, timeout=6, attempts=1):
                 time.sleep(0.8)
                 continue
             log(f'[CDNProbe] unreachable {type(e).__name__} after {attempts} try: {url[:70]}')
+            _cdn_record(host, False)
             return False
         if r.status_code != 200:
             log(f'[CDNProbe] HTTP {r.status_code}: {url[:90]}')
+            _cdn_record(host, False)
             return False
         if not r.text[:400].lstrip().startswith('#EXTM3U'):
             log(f'[CDNProbe] not a playlist (first bytes: {r.content[:16]!r}): {url[:90]}')
+            _cdn_record(host, False)
             return False
+        _cdn_record(host, True)
         return True
+    _cdn_record(host, False)
     return False
 
 
