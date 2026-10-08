@@ -1,4 +1,4 @@
-# version: 1.2.41 (doit correspond à addon.xml)
+# version: 1.2.42 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -5129,6 +5129,9 @@ def _ap_clean_url(u):
 _AP_IFRAME_RX = re.compile(r'''<iframe[^>]+src=["'](https?://[^"']{10,200})["']''')
 _AP_STREAM_URL_RX = re.compile(r'''streamUrl\s*:\s*["'](https?:[^"']+)["']''')
 _AP_PATHS = ('stream', 'cast', 'watch', 'plus', 'casting', 'player', 'embed')
+# Two consecutive refusals are enough: get_active_base already probed the portal, so
+# a third page would only repeat the same 8s wait.
+_AP_PORTAL_GIVEUP = 2
 
 
 def _decode_host(url):
@@ -5494,14 +5497,17 @@ def get_any_player_stream(channel_id):
             return result
         if _portal_unreachable():
             portal_down += 1
-    if portal_down >= 3:
-        # Every player page sits behind the same portal. Once it has refused three
-        # of them there is nothing left to learn here, and walking the remaining
-        # backends — ksohls, StreamPage, CHEVY — costs ~25s of retries to arrive at
-        # the same conclusion, because each of them needs the portal as well.
-        log(f'[AnyPlayer] portal unreachable ({portal_down}/{len(_AP_PATHS)} pages) — '
-            f'abandoning, no backend can resolve id={channel_id} without it')
-        return None
+            if portal_down >= _AP_PORTAL_GIVEUP:
+                # Every player page sits behind the same portal, and get_active_base
+                # has already seen it refuse. Walking the remaining pages costs 8s
+                # each to learn exactly the same thing: measured 7 pages = 56s for
+                # a channel that was unreachable, with the portal refusing all along.
+                skipped = len(_AP_PATHS) - _AP_PATHS.index(path) - 1
+                log(f'[AnyPlayer] portal unreachable ({portal_down} consecutive pages, '
+                    f'{skipped} skipped) — id={channel_id} cannot resolve without it')
+                return None
+        else:
+            portal_down = 0
     log(f'[AnyPlayer] no stream found for id={channel_id}')
     return None
 
