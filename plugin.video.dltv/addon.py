@@ -1,4 +1,4 @@
-# version: 1.2.38 (doit correspond à addon.xml)
+# version: 1.2.39 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -5423,6 +5423,16 @@ def _try_player_page(channel_id, player_url, watch_url, sess):
         return None
 
 
+def _portal_unreachable(window=6.0):
+    """True when the portal just refused us recently.
+
+    get_active_base probes the portal on its first call and remembers failure for
+    _ACTIVE_BASE_FAIL_TTL, so this reads that state instead of spending another
+    connection on every check."""
+    return bool(_active_base_failed_at and
+                time.time() - _active_base_failed_at < window)
+
+
 def get_any_player_stream(channel_id):
     """Try all player pages (stream, cast, watch, plus, casting, player, embed) in order.
     Applies auto-detection on each: superdinamico/ligapk, lovecdn-style (domain-agnostic),
@@ -5430,12 +5440,23 @@ def get_any_player_stream(channel_id):
     Returns (url, origin) tuple on success, or None if all fail."""
     watch_url = abs_url(f'watch.php?id={channel_id}')
     sess = _get_session()
+    portal_down = 0
     for path in _AP_PATHS:
         player_url = abs_url(f'{path}/stream-{channel_id}.php')
         log(f'[AnyPlayer] Trying {path}/stream-{channel_id}.php')
         result = _try_player_page(channel_id, player_url, watch_url, sess)
         if result:
             return result
+        if _portal_unreachable():
+            portal_down += 1
+    if portal_down >= 3:
+        # Every player page sits behind the same portal. Once it has refused three
+        # of them there is nothing left to learn here, and walking the remaining
+        # backends — ksohls, StreamPage, CHEVY — costs ~25s of retries to arrive at
+        # the same conclusion, because each of them needs the portal as well.
+        log(f'[AnyPlayer] portal unreachable ({portal_down}/{len(_AP_PATHS)} pages) — '
+            f'abandoning, no backend can resolve id={channel_id} without it')
+        return None
     log(f'[AnyPlayer] no stream found for id={channel_id}')
     return None
 
@@ -6468,6 +6489,17 @@ def PlayStream(link):
             log('[PlayStream] slug cached — wideiptv needs no portal request')
         for _cdn in _PLAYBACK_CASCADE:
             _label = _CDN_LABELS.get(_cdn, 'Auto — CHEVY (CDN)')
+            # Only wideiptv can resolve a channel without the portal, and only when
+            # its slug is cached. Everything else goes through dlive.sx, so once the
+            # portal refuses, walking the remaining backends burns ~25s of retries
+            # across ksohls, StreamPage and CHEVY to reach the same dead end.
+            if _portal_unreachable() and _cdn != '__wideiptv__':
+                log(f'[PlayStream] skipping {_label} — portal unreachable')
+                continue
+            if _cdn == '__wideiptv__' and not _wide_slug_cached(channel_id) \
+                    and _portal_unreachable():
+                log('[PlayStream] skipping wideiptv — portal unreachable and no cached slug')
+                continue
             log(f'[PlayStream] trying backend: {_label}')
             _res = _resolve_playback(channel_id, channel_key, _cdn)
             if _res:
