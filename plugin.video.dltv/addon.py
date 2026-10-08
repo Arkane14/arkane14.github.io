@@ -1,4 +1,4 @@
-# version: 1.2.36 (doit correspond à addon.xml)
+# version: 1.2.37 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -5067,6 +5067,20 @@ def _probe_hls_url(url):
 _AP_SKIP_HOSTS = ('sstatic', 'histats', 'adsco', 'fidget', 'chatango',
                   'facebook.com', 'google.com', 'ksohls.ru')
 _AP_M3U8_RX = re.compile(r'''["'](https?://[^\s"'<>]+\.m3u8[^"']*)["']''')
+# Some players emit \u0026 for the query separator instead of a literal ampersand.
+# The URL is then unusable as-is: the CDN reads the token as st="...\u0026e=...".
+# Observed on xstream.st, which fronts instreams.{live,pro,online} and is the source
+# for channel ids whose catalog entry carries no name (1507, 1668, 1088, 1670).
+_AP_UNESCAPE_RX = re.compile(r'\\u00(26|2f|3a|2A)', re.I)
+
+
+def _ap_clean_url(u):
+    """Turn a JSON/JS-escaped URL back into a usable one."""
+    if not u:
+        return u
+    out = u.replace('\\/', '/')
+    return _AP_UNESCAPE_RX.sub(lambda m: {'26': '&', '2f': '/', '3a': ':'}[m.group(1).lower()], out)
+
 _AP_IFRAME_RX = re.compile(r'''<iframe[^>]+src=["'](https?://[^"']{10,200})["']''')
 _AP_STREAM_URL_RX = re.compile(r'''streamUrl\s*:\s*["'](https?:[^"']+)["']''')
 _AP_PATHS = ('stream', 'cast', 'watch', 'plus', 'casting', 'player', 'embed')
@@ -5110,7 +5124,7 @@ def _try_player_page(channel_id, player_url, watch_url, sess):
 
         # ── Generic: direct .m3u8 URL in page source — probe each, skip broken ──
         for mm in _AP_M3U8_RX.finditer(html):
-            candidate = mm.group(1)
+            candidate = _ap_clean_url(mm.group(1))
             # skip blogspot/r-strm wrapper URLs (they serve HTML, not m3u8)
             if 'blogspot.com' in candidate or 'r-strm.' in candidate:
                 continue
@@ -5160,7 +5174,7 @@ def _try_player_page(channel_id, player_url, watch_url, sess):
                         except Exception as _ll_e:
                             log(f'[AnyPlayer] ligue1live inner error: {_ll_e}')
                 for mi in _AP_M3U8_RX.finditer(ri.text):
-                    candidate = mi.group(1)
+                    candidate = _ap_clean_url(mi.group(1))
                     if 'blogspot.com' in candidate or 'r-strm.' in candidate:
                         continue
                     try:
