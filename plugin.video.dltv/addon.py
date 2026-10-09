@@ -1,4 +1,4 @@
-# version: 1.2.42 (doit correspond à addon.xml)
+# version: 1.2.43 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -5688,6 +5688,72 @@ def _wide_freshen_url(raw_url, slug):
     return base_url + '?' + urlencode(qs)
 
 
+def _wide_probe(manifest_url, slug, timeout=6):
+    """Prove a wideiptv stream actually delivers video, not just that the host answers.
+
+    _cdn_reachable only asks the CDN for a manifest, and it answers "yes" on nodes that
+    then hand Kodi a playlist it cannot open: measured on the same log, 6 of 8 launches
+    ended in Kodi's "Error creating demuxer" after its 30 s give-up, while DLTV had
+    already logged "Stream started". Walking the chain here — media playlist, then the
+    first segment, checked for MPEG-TS — costs one extra fetch on a healthy node and
+    catches the case where the CDN is up but the stream is not.
+    """
+    hdrs = {'User-Agent': UA, 'Referer': f'https://wideiptv.top/player/{slug}'}
+
+    try:
+        r = requests.get(_wide_freshen_url(manifest_url, slug), headers=hdrs, timeout=timeout)
+    except Exception as e:
+        log(f'[WideProbe] manifest unreachable ({type(e).__name__}): {manifest_url[:70]}')
+        return False
+    if r.status_code != 200 or r.content[:7] != b'#EXTM3U':
+        log(f'[WideProbe] manifest HTTP {r.status_code} or not a playlist')
+        return False
+
+    media_url = manifest_url
+    lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
+    variants = [ln for ln in lines if ln and not ln.startswith('#')]
+    if variants and '#EXT-X-STREAM-INF' in r.text:
+        # master playlist: Kodi will ask for a variant first, so test that one
+        media_url = urljoin(r.url, variants[0])
+        try:
+            rm = requests.get(_wide_freshen_url(media_url, slug), headers=hdrs, timeout=timeout)
+        except Exception as e:
+            log(f'[WideProbe] media playlist unreachable ({type(e).__name__})')
+            return False
+        if rm.status_code != 200 or rm.content[:7] != b'#EXTM3U':
+            log(f'[WideProbe] media playlist HTTP {rm.status_code} or not a playlist')
+            return False
+        text, final = rm.text, rm.url
+    else:
+        text, final = r.text, r.url
+
+    seg = next((ln for ln in text.splitlines()
+                if ln.strip() and not ln.startswith('#')), None)
+    if not seg:
+        log('[WideProbe] playlist carries no segment')
+        return False
+    seg_url = _wide_freshen_url(urljoin(final, seg.strip()), slug)
+    for attempt in range(_WIDE_FETCH_ATTEMPTS):
+        try:
+            rs = requests.get(seg_url, headers=hdrs, timeout=timeout, stream=True)
+            body = b''.join(rs.iter_content(65536)[:4])
+            rs.close()
+            break
+        except Exception as e:
+            if attempt < _WIDE_FETCH_ATTEMPTS - 1:
+                time.sleep(0.4)
+    else:
+        log('[WideProbe] first segment unreachable — CDN up but not serving')
+        return False
+
+    if not _is_media_segment(body):
+        log(f'[WideProbe] first segment is not media ({len(body)}B {body[:12]!r}) — '
+            'the CDN answers but sends no video')
+        return False
+    log(f'[WideProbe] first segment OK ({len(body)}B MPEG-TS), stream is real')
+    return True
+
+
 def _is_media_segment(body):
     """True when body looks like a real media segment rather than a placeholder.
 
@@ -6430,7 +6496,8 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
         # refusing TCP). Probe it first and fall back to the premiumtv direct HLS
         # instead of letting Kodi fail with a bare "Error creating demuxer".
         if not _cdn_reachable(w_url, referer=f'https://wideiptv.top/player/{w_slug}',
-                                  timeout=5, attempts=4):
+                                  timeout=5, attempts=4) or \
+           not _wide_probe(w_url, w_slug):
             log(f'[PlayStream] wideiptv CDN unreachable — falling back to premiumtv direct HLS')
             direct_url, direct_ref = get_direct_hls_url(channel_id)
             if not direct_url:
