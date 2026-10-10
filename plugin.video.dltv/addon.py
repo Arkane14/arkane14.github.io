@@ -1,4 +1,4 @@
-# version: 1.2.49 (doit correspond à addon.xml)
+# version: 1.2.50 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -1515,6 +1515,8 @@ def _proxy_headers(origin):
 # and a 403 still triggers one retry with the next candidate. Once a CDN host has
 # accepted an origin, that choice is reused for the rest of the session.
 _PTV_ORIGIN_FALLBACKS = ('https://dlive.sx', 'https://dlhd.st')
+# A premiumtv segment is ~3.4 MB; 0.74 Mo/s is 4.6 s on its own.
+_PTV_SEGMENT_TIMEOUT = 15
 _ptv_origin_lock = threading.Lock()
 _ptv_good_origin = {}          # cdn host -> origin that the CDN accepted
 
@@ -1545,8 +1547,21 @@ def _ptv_fetch(url, origin, cdn_host='', timeout=8):
     candidates += [o for o in [page_root] + list(_PTV_ORIGIN_FALLBACKS) if o not in candidates]
     last = None
     for i, o in enumerate(candidates):
-        r = requests.get(url, headers={'User-Agent': UA, 'Origin': o, 'Referer': referer},
-                         timeout=timeout)
+        try:
+            r = requests.get(url, headers={'User-Agent': UA, 'Origin': o, 'Referer': referer},
+                             timeout=timeout)
+        except Exception as e:
+            # A segment that times out is retried against the next Origin: the read
+            # timeout was measured against a 3.4 MB payload arriving at 0.74 Mo/s,
+            # which is 4.6 s — the old 5 s budget left no margin at all, and the log
+            # was full of "Read timed out" on the segment host before the stream
+            # could play. Losing a slow segment to a timeout helps nobody.
+            last = None
+            if i < len(candidates) - 1:
+                log(f'[PremiumTV] {type(e).__name__} avec Origin {o}, essai suivant')
+                continue
+            log(f'[PremiumTV] {type(e).__name__} sur {url[:56]}')
+            raise
         if r.status_code != 403:
             if cdn_host and o != known:
                 with _ptv_origin_lock:
@@ -1555,6 +1570,8 @@ def _ptv_fetch(url, origin, cdn_host='', timeout=8):
             return r.status_code, r.content, r.url, r.headers
         last = r
         log(f'[PremiumTV] HTTP 403 avec Origin {o}' + (f' sur {url[:56]}' if i == 0 else ''))
+    if last is None:
+        raise IOError(f'premiumtv unreachable: {url[:70]}')
     return last.status_code, last.content, last.url, last.headers
 
 
@@ -2660,7 +2677,12 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 return
 
             _cdn_host = urlparse(raw_url).hostname or ''
-            _code, _body, _final, _rh = _ptv_fetch(raw_url, origin, _cdn_host, timeout=5)
+            # 15 s, not 5: a premiumtv segment is ~3.4 MB and the measured throughput
+            # on that host is 0.74-1.17 Mo/s, so a healthy fetch already takes up to
+            # 4.6 s. A 5 s budget turned ordinary slowness into "Read timed out" and a
+            # dead stream, while the bandwidth could not have delivered it faster.
+            _code, _body, _final, _rh = _ptv_fetch(raw_url, origin, _cdn_host,
+                                                  timeout=_PTV_SEGMENT_TIMEOUT)
             hdrs = {'Referer': origin if '?' in origin else origin.rstrip('/') + '/'}
             referer = hdrs['Referer']
 
