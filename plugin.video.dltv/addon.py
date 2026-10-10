@@ -1,4 +1,4 @@
-# version: 1.2.50 (doit correspond à addon.xml)
+# version: 1.2.51 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -594,6 +594,7 @@ _ptv_seg_lock = threading.Lock()
 # loses its buffer, and the proxy is asked again after a retry, so the repeat is
 # common enough to be worth 3 slots of ~5 MB.
 _PTV_SEG_CACHE_MAX = 3
+_PTV_PREFETCH_AHEAD = 2      # segments fetched while ISA opens the playlist
 
 _wide_seg_cache = {}            # seg_key -> bytes (wideiptv pre-downloaded segments)
 _wide_seg_cache_lock = threading.Lock()
@@ -1470,6 +1471,43 @@ def _unwrap_ptv_segment(body):
     if not ts or ts[0] != 0x47:
         return None
     return ts
+
+
+def _ptv_prefetch(urls, origin):
+    """Fetch and unwrap the first segments before inputstream.adaptive asks for them.
+
+    The cache used to fill only *after* ISA requested a segment, so the first one
+    cost a full download plus the PNG decode before Kodi had any data at all: in the
+    measured session, 26 s elapsed between "Stream started" and the first segment
+    being served, and the three channels that failed with "Error creating demuxer"
+    were exactly the ones whose first segment was 5-6 MB. Starting the work when the
+    playlist is served takes that off the critical path."""
+    def _one(u, origin_page):
+        key = u.split('?', 1)[0]
+        if _ptv_cache_get(key) is not None:
+            return
+        try:
+            host = urlparse(u).hostname or ''
+            code, body, _final, _hdrs = _ptv_fetch(u, origin_page, host,
+                                                    timeout=_PTV_SEGMENT_TIMEOUT)
+        except Exception as e:
+            log(f'[PremiumTVPrefetch] {type(e).__name__} sur {u[-40:]}')
+            return
+        if code != 200 or not body:
+            return
+        t0 = time.time()
+        ts = _unwrap_ptv_segment(body)
+        if ts:
+            _ptv_cache_store(key, ts)
+            log(f'[PremiumTVPrefetch] segment {len(body)}B -> {len(ts)}B '
+                f'precharge en {(time.time() - t0) * 1000:.0f} ms')
+
+    def _run():
+        for u in urls:
+            _one(u, origin)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
 
 
 def _ptv_cache_get(key):
@@ -2800,6 +2838,7 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
             base = r.url.split('?')[0].rsplit('/', 1)[0] + '/'  # use final URL after redirect
             enc_orig = quote_plus(origin)
             lines = []
+            abs_segs = []
             dropped = 0
             for line in r.text.splitlines():
                 stripped = line.strip()
@@ -2811,10 +2850,16 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                         dropped += 1
                         continue
                     lines.append(f'http://127.0.0.1:{port}/raw/{enc_orig}/{quote_plus(stripped)}')
+                    if len(abs_segs) <= _PTV_PREFETCH_AHEAD:
+                        abs_segs.append(stripped)
                 else:
                     lines.append(line)
             if dropped:
                 log(f'[PremiumTVProxy] filtered {dropped} relative segment(s) from playlist')
+            if abs_segs:
+                # Start pulling the opening segments while ISA is still opening the
+                # playlist, so the first bytes are already decoded when it asks.
+                _ptv_prefetch(abs_segs[:_PTV_PREFETCH_AHEAD], origin)
             body = '\n'.join(lines).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/vnd.apple.mpegurl')
