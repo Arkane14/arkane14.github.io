@@ -1,4 +1,4 @@
-# version: 1.2.46 (doit correspond à addon.xml)
+# version: 1.2.47 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -86,14 +86,37 @@ _CUSTOM_DNS = addon.getSetting('custom_dns').strip()
 EXTRA_M3U8_URL = 'http://drewlive2423.duckdns.org:8081/DrewLive/MergedPlaylist.m3u8'
 
 
-_s_chevy_proxy = addon.getSetting('chevy_proxy_url').strip()
+_DISCOVERY_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_discovery.json')
+
+
+def _discovered(key, default=''):
+    """Servers found by Discovery. They live in dltv_discovery.json rather than in
+    settings.xml, which Kodi can be truncating when it kills the process — that is
+    what produced "failed to load addon settings" on every launch. Installs written
+    before the move still have the settings, so both are read."""
+    try:
+        with open(_DISCOVERY_CACHE_FILE, encoding='utf-8') as f:
+            val = (json.load(f) or {}).get(key) or ''
+        if val:
+            return val
+    except Exception:
+        pass
+    try:
+        return addon.getSetting({'proxy': 'chevy_proxy_url',
+                                 'lookup': 'chevy_lookup_url',
+                                 'ksohls': 'ksohls_base_url'}[key]).strip()
+    except Exception:
+        return default
+
+
+_s_chevy_proxy = _discovered('proxy')
 CHEVY_PROXY = _s_chevy_proxy if _s_chevy_proxy else 'https://chevy.soyspace.cyou'
-_s_chevy_lookup = addon.getSetting('chevy_lookup_url').strip()
+_s_chevy_lookup = _discovered('lookup')
 CHEVY_LOOKUP = _s_chevy_lookup if _s_chevy_lookup else 'https://chevy.vovlacosa.sbs'
 # Hardcoded fallbacks — never overwritten by Discovery (used when discovered servers are down)
 _CHEVY_PROXY_BUILTIN = 'https://chevy.soyspace.cyou'
 _CHEVY_LOOKUP_BUILTIN = 'https://chevy.vovlacosa.sbs'
-_s_ksohls = addon.getSetting('ksohls_base_url').strip()
+_s_ksohls = _discovered('ksohls')
 _KSOHLS_BASE = _s_ksohls if _s_ksohls else 'https://www.ksohls.ru'
 PLAYER_REFERER = _KSOHLS_BASE + '/'
 _KSOHLS_FALLBACK_BASES = ['https://www.ksohls.ru', 'https://enviromentalspace.cyou']
@@ -128,7 +151,6 @@ _XMLTV_SOURCES = {
 }
 
 _CDN_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_cdn_map.json')
-_DISCOVERY_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_discovery.json')
 _DISCOVERY_CACHE_TTL = 12 * 3600  # re-discover every 12h
 _CDN_CACHE_TTL = 3600  # 1 hour
 _CDN_STATUS_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_cdn_status.json')
@@ -167,6 +189,7 @@ _PAGE_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_page_cache.json')
 _FAILED_KEY = '__failed_urls'   # failure marks live in the same file, separate key
 _PORTAL_KEY = '__portal_quota'  # TCP-connection budget, same file
 _WIDE_NODES_KEY = '__wide_nodes'  # per-node service verdicts, same file
+_PORTAL_BASE_FILE = os.path.join(_KODI_TEMP, 'dltv_portal_base.txt')
 
 
 def _aes128_cbc_decrypt(data, key, iv):
@@ -1206,17 +1229,16 @@ def _discover_server_urls():
         except Exception:
             pass
 
+        # Only the JSON file above is written. This runs in a daemon thread and Kodi
+        # tears the process down on exit: a setSetting() in flight at that moment
+        # leaves settings.xml truncated, which is what made Kodi log "failed to load
+        # addon settings" seventeen times in a session. These are machine state, not
+        # user preferences, so they have no business in that file.
         if chevy_proxy:
             CHEVY_PROXY = chevy_proxy
             CHEVY_LOOKUP = effective_lookup
-            _set_setting('chevy_proxy_url', chevy_proxy)
-            _set_setting('chevy_lookup_url', effective_lookup)
-            _set_setting('ksohls_base_url', ksohls_base)
             log(f'[Discovery] Updated: proxy={chevy_proxy} lookup={effective_lookup} ksohls={ksohls_base}')
         else:
-            _set_setting('ksohls_base_url', ksohls_base)
-            if effective_lookup:
-                _set_setting('chevy_lookup_url', effective_lookup)
             log(f'[Discovery] Updated ksohls only (page has no literal proxy URL): ksohls={ksohls_base}')
 
     except Exception as e:
@@ -3490,6 +3512,24 @@ def _save_portal_state(st):
             pass
 
 
+def _load_portal_base():
+    """The active portal root. Kept in a file, not in settings.xml: it used to be a
+    setting written by get_active_base(), which Kodi can be mid-write on when it
+    shuts the process down."""
+    try:
+        with open(_PORTAL_BASE_FILE, encoding='utf-8') as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
+def _save_portal_base(value):
+    try:
+        _write_file(_PORTAL_BASE_FILE, value or '')
+    except OSError:
+        pass
+
+
 def _portal_offline():
     """True when the portal is quarantined: it refused us repeatedly and the block
     has not expired. Talking to it again would only spend connections we do not
@@ -3694,7 +3734,7 @@ def get_active_base():
             base += '/'
         _active_base_cache = base
         return base
-    base = addon.getSetting('active_baseurl')
+    base = _load_portal_base()
     if base:
         # Validate once per process — if unreachable, fall back to seed
         try:
@@ -3706,10 +3746,10 @@ def get_active_base():
             log(f'[get_active_base] {base} invalide ({e}), reset vers seed')
             base = ''
             _active_base_failed_at = time.time()
-            _set_setting('active_baseurl', '')
+            _save_portal_base('')
     if not base:
         base = normalize_origin(SEED_BASEURL)
-        _set_setting('active_baseurl', base)
+        _save_portal_base(base)
     if not base.endswith('/'):
         base += '/'
     _active_base_cache = base
@@ -7345,9 +7385,6 @@ try:
                     PLAYER_REFERER = _KSOHLS_BASE + '/'
                     _SEG_HEADERS['Origin'] = _KSOHLS_BASE
                     _SEG_HEADERS['Referer'] = PLAYER_REFERER
-                    _set_setting('chevy_proxy_url', CHEVY_PROXY)
-                    _set_setting('chevy_lookup_url', CHEVY_LOOKUP)
-                    _set_setting('ksohls_base_url', _KSOHLS_BASE)
                     _disco_fresh = True
                     log(f'[Discovery] Cache OK: ksohls={_KSOHLS_BASE} proxy={CHEVY_PROXY}')
                 else:
@@ -7356,11 +7393,10 @@ try:
                         os.remove(_DISCOVERY_CACHE_FILE)
                     except Exception:
                         pass
-                    # Reset globals and addon settings to builtin defaults
+                    # Reset globals to the builtin servers (settings.xml is left alone:
+                    # nothing here belongs in it, see _discover_server_urls)
                     CHEVY_PROXY = _CHEVY_PROXY_BUILTIN
                     CHEVY_LOOKUP = _CHEVY_LOOKUP_BUILTIN
-                    _set_setting('chevy_proxy_url', '')
-                    _set_setting('chevy_lookup_url', '')
     if not _disco_fresh:
         threading.Thread(target=_discover_server_urls, daemon=True).start()
 except Exception as _e:
