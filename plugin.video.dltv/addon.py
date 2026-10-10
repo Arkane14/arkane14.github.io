@@ -1,4 +1,4 @@
-# version: 1.2.48 (doit correspond à addon.xml)
+# version: 1.2.49 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -152,6 +152,8 @@ _XMLTV_SOURCES = {
 
 _CDN_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_cdn_map.json')
 _DISCOVERY_CACHE_TTL = 12 * 3600  # re-discover every 12h
+_DISCOVERY_RETRY_MIN = 900      # never spend two portal connections inside 15 min
+_DISCOVERY_ATTEMPT_FILE = os.path.join(_KODI_TEMP, 'dltv_discovery_attempt')
 _CDN_CACHE_TTL = 3600  # 1 hour
 _CDN_STATUS_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_cdn_status.json')
 _CDN_STATUS_TTL = 300  # 5 minutes
@@ -1164,6 +1166,27 @@ def _fetch_direct_m3u8_url(channel_id):
     return None, None
 
 
+def _discovery_mark_attempt():
+    """Record that Discovery ran, even when it failed.
+
+    A failed discovery used to leave no trace and, worse, delete its own cache, so
+    the next channel launched it again — one portal connection per channel, forever,
+    all of it spent rediscovering a host it had just found."""
+    try:
+        with open(_DISCOVERY_ATTEMPT_FILE, 'w') as f:
+            f.write(str(time.time()))
+    except OSError:
+        pass
+
+
+def _discovery_recently_attempted(window=None):
+    w = _DISCOVERY_RETRY_MIN if window is None else window
+    try:
+        return time.time() - os.path.getmtime(_DISCOVERY_ATTEMPT_FILE) < w
+    except OSError:
+        return False
+
+
 def _discover_server_urls():
     """Auto-discover CHEVY_PROXY, CHEVY_LOOKUP and _KSOHLS_BASE from the site's auth player page.
     Fetches stream/stream-1.php → finds premiumtv iframe → parses CHEVY URLs from its JS.
@@ -1243,6 +1266,7 @@ def _discover_server_urls():
 
     except Exception as e:
         log(f'[Discovery] error: {e}')
+        _discovery_mark_attempt()
 
 
 def _state_file(channel_key):
@@ -7400,10 +7424,23 @@ try:
         if time.time() - os.path.getmtime(_DISCOVERY_CACHE_FILE) < _DISCOVERY_CACHE_TTL:
             with open(_DISCOVERY_CACHE_FILE) as _f:
                 _d = json.load(_f)
-            if _d.get('proxy') and _d.get('lookup') and _d.get('ksohls'):
-                # Validate cached proxy is still reachable before committing to it
-                if _proxy_host_reachable(_d['proxy']):
-                    CHEVY_PROXY = _d['proxy']
+            # "proxy" is absent most of the time — the site rarely publishes a literal
+            # one — and requiring it here made every cache read fail, so Discovery ran
+            # again on every single channel and spent a portal connection each time to
+            # rediscover the same ksohls host. ksohls + lookup is enough to be useful.
+            if _d.get('lookup') and _d.get('ksohls'):
+                # Validate the cached proxy before committing to it, when there is one
+                if _d.get('proxy') and not _proxy_host_reachable(_d['proxy']):
+                    log(f'[Discovery] Cached proxy unreachable ({_d["proxy"]}) — resetting to builtin servers')
+                    try:
+                        os.remove(_DISCOVERY_CACHE_FILE)
+                    except Exception:
+                        pass
+                    CHEVY_PROXY = _CHEVY_PROXY_BUILTIN
+                    CHEVY_LOOKUP = _CHEVY_LOOKUP_BUILTIN
+                else:
+                    if _d.get('proxy'):
+                        CHEVY_PROXY = _d['proxy']
                     CHEVY_LOOKUP = _d['lookup']
                     _KSOHLS_BASE = _d['ksohls']
                     PLAYER_REFERER = _KSOHLS_BASE + '/'
@@ -7411,17 +7448,13 @@ try:
                     _SEG_HEADERS['Referer'] = PLAYER_REFERER
                     _disco_fresh = True
                     log(f'[Discovery] Cache OK: ksohls={_KSOHLS_BASE} proxy={CHEVY_PROXY}')
-                else:
-                    log(f'[Discovery] Cached proxy unreachable ({_d["proxy"]}) — resetting to builtin servers')
-                    try:
-                        os.remove(_DISCOVERY_CACHE_FILE)
-                    except Exception:
-                        pass
-                    # Reset globals to the builtin servers (settings.xml is left alone:
-                    # nothing here belongs in it, see _discover_server_urls)
-                    CHEVY_PROXY = _CHEVY_PROXY_BUILTIN
-                    CHEVY_LOOKUP = _CHEVY_LOOKUP_BUILTIN
+    if not _disco_fresh and _discovery_recently_attempted():
+        # Last attempt failed or produced nothing usable. Trying again now only burns
+        # a portal connection — the budget is ~19 for the session.
+        log(f'[Discovery] skipped — already tried {_DISCOVERY_RETRY_MIN // 60} min ago')
+        _disco_fresh = True
     if not _disco_fresh:
+        _discovery_mark_attempt()
         threading.Thread(target=_discover_server_urls, daemon=True).start()
 except Exception as _e:
     log(f'[Discovery] init error: {_e}')
