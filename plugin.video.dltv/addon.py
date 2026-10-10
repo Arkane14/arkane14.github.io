@@ -1,4 +1,4 @@
-# version: 1.2.44 (doit correspond à addon.xml)
+# version: 1.2.45 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -166,6 +166,7 @@ _FAV_PROBE_TS_FILE = os.path.join(_KODI_TEMP, 'dltv_fav_probe_ts')
 _PAGE_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_page_cache.json')
 _FAILED_KEY = '__failed_urls'   # failure marks live in the same file, separate key
 _PORTAL_KEY = '__portal_quota'  # TCP-connection budget, same file
+_WIDE_NODES_KEY = '__wide_nodes'  # per-node service verdicts, same file
 
 
 def _aes128_cbc_decrypt(data, key, iv):
@@ -5809,14 +5810,23 @@ def _wide_probe(manifest_url, slug, timeout=6):
     first segment, checked for MPEG-TS — costs one extra fetch on a healthy node and
     catches the case where the CDN is up but the stream is not.
     """
+    host = urlparse(manifest_url).hostname or ''
+    known = _wide_node_verdict(host)
+    if known is False:
+        log(f'[WideProbe] {host} is known not to serve — skipped '
+            f'(no request spent, verdict from the last {_WIDE_NODE_TTL}s)')
+        return False
+
     hdrs = {'User-Agent': UA, 'Referer': f'https://wideiptv.top/player/{slug}'}
 
     try:
         r = requests.get(_wide_freshen_url(manifest_url, slug), headers=hdrs, timeout=timeout)
     except Exception as e:
+        _wide_node_record(host, False)
         log(f'[WideProbe] manifest unreachable ({type(e).__name__}): {manifest_url[:70]}')
         return False
     if r.status_code != 200 or r.content[:7] != b'#EXTM3U':
+        _wide_node_record(host, False)
         log(f'[WideProbe] manifest HTTP {r.status_code} or not a playlist')
         return False
 
@@ -5829,9 +5839,11 @@ def _wide_probe(manifest_url, slug, timeout=6):
         try:
             rm = requests.get(_wide_freshen_url(media_url, slug), headers=hdrs, timeout=timeout)
         except Exception as e:
+            _wide_node_record(host, False)
             log(f'[WideProbe] media playlist unreachable ({type(e).__name__})')
             return False
         if rm.status_code != 200 or rm.content[:7] != b'#EXTM3U':
+            _wide_node_record(host, False)
             log(f'[WideProbe] media playlist HTTP {rm.status_code} or not a playlist')
             return False
         text, final = rm.text, rm.url
@@ -5841,6 +5853,7 @@ def _wide_probe(manifest_url, slug, timeout=6):
     seg = next((ln for ln in text.splitlines()
                 if ln.strip() and not ln.startswith('#')), None)
     if not seg:
+        _wide_node_record(host, False)
         log('[WideProbe] playlist carries no segment')
         return False
     seg_url = _wide_freshen_url(urljoin(final, seg.strip()), slug)
@@ -5854,13 +5867,16 @@ def _wide_probe(manifest_url, slug, timeout=6):
             if attempt < _WIDE_FETCH_ATTEMPTS - 1:
                 time.sleep(0.4)
     else:
+        _wide_node_record(host, False)
         log('[WideProbe] first segment unreachable — CDN up but not serving')
         return False
 
     if not _is_media_segment(body):
+        _wide_node_record(host, False)
         log(f'[WideProbe] first segment is not media ({len(body)}B {body[:12]!r}) — '
             'the CDN answers but sends no video')
         return False
+    _wide_node_record(host, True)
     log(f'[WideProbe] first segment OK ({len(body)}B MPEG-TS), stream is real')
     return True
 
@@ -6046,13 +6062,60 @@ def _upstream_alive(url, referer=None, timeout=6):
     return True
 
 
-_cdn_health = {}                # host -> (reachable: bool, timestamp)
+_cdn_health = {}                # host -> (reachable: bool, timestamp), mirrored to disk
 _cdn_health_lock = threading.Lock()
 # A node that refuses connections stays dead for the whole outage, but the probe was
 # being repeated for every channel: measured 6 consecutive probes over 252 s on one
 # outage, each costing ~17 s before the fallback. One verdict per host per window is
 # enough — the node does not come back mid-zap.
 _CDN_HEALTH_TTL = 60
+
+
+_WIDE_NODE_TTL = 300           # how long a "this node does not serve" verdict holds
+
+
+def _wide_node_verdict(host):
+    """Last verdict for a wideiptv CDN node, read from disk so it survives the
+    interpreter Kodi restarts for every channel. Returns True (serves), False (does
+    not) or None (unknown)."""
+    try:
+        with open(_PAGE_CACHE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        nodes = data.get(_WIDE_NODES_KEY) if isinstance(data, dict) else None
+        entry = nodes.get(host) if isinstance(nodes, dict) else None
+        if isinstance(entry, (list, tuple)) and len(entry) == 2:
+            ok, ts = bool(entry[0]), float(entry[1])
+            if time.time() - ts < _WIDE_NODE_TTL:
+                return ok
+    except Exception:
+        pass
+    return None
+
+
+def _wide_node_record(host, ok):
+    try:
+        with open(_PAGE_CACHE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    nodes = data.get(_WIDE_NODES_KEY) if isinstance(data, dict) else None
+    if not isinstance(nodes, dict):
+        nodes = {}
+    nodes[host] = [bool(ok), time.time()]
+    data[_WIDE_NODES_KEY] = nodes
+    _dir = os.path.dirname(_PAGE_CACHE_FILE)
+    fd, tmp_path = tempfile.mkstemp(dir=_dir)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        os.replace(tmp_path, _PAGE_CACHE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def _cdn_verdict(host):
