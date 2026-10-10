@@ -1,4 +1,4 @@
-# version: 1.2.45 (doit correspond à addon.xml)
+# version: 1.2.46 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -1456,6 +1456,62 @@ def _proxy_headers(origin):
     return {'User-Agent': UA, 'Origin': root, 'Referer': referer}
 
 
+# The premiumtv CDN answers 403 to any Origin outside a short allow-list, and the
+# portal aliases are not all on it: measured on the live CDN, the very same manifest
+# returns 200 for Origin https://dlive.sx and for https://dlhd.st, and 403 for
+# https://dlstreams.st, https://wideiptv.top and the CDN's own host. The discovery
+# thread had switched the base URL to dlstreams.st, so every manifest started
+# failing while the pre-flight check — which sends no Origin at all — still passed.
+# One origin then poisoned playback: DLTV reported "backend OK" and Kodi died with
+# "Error creating demuxer" three tenths of a second later.
+#
+# So the Origin is chosen from the allow-list, not from whichever alias is active,
+# and a 403 still triggers one retry with the next candidate. Once a CDN host has
+# accepted an origin, that choice is reused for the rest of the session.
+_PTV_ORIGIN_FALLBACKS = ('https://dlive.sx', 'https://dlhd.st')
+_ptv_origin_lock = threading.Lock()
+_ptv_good_origin = {}          # cdn host -> origin that the CDN accepted
+
+
+def _ptv_headers(origin, cdn_host=''):
+    """Headers for a premiumtv CDN request, with an Origin the CDN will accept."""
+    with _ptv_origin_lock:
+        known = _ptv_good_origin.get(cdn_host)
+    if known:
+        return {'User-Agent': UA, 'Origin': known,
+                'Referer': origin if '?' in origin else origin.rstrip('/') + '/'}
+    return _proxy_headers(origin)
+
+
+def _ptv_fetch(url, origin, cdn_host='', timeout=8):
+    """Fetch a premiumtv resource, retrying on 403 with an allow-listed Origin.
+
+    Returns (status_code, content, final_url, headers). A 403 that survives every
+    candidate is returned as-is so the caller can report it honestly."""
+    parsed = urlparse(origin)
+    page_root = f'{parsed.scheme}://{parsed.netloc}' if parsed.scheme and parsed.netloc else origin
+    referer = origin if '?' in origin else origin.rstrip('/') + '/'
+    # The origin this CDN host already accepted goes first, so a stream that works
+    # keeps working after the portal alias rotates underneath it.
+    with _ptv_origin_lock:
+        known = _ptv_good_origin.get(cdn_host) if cdn_host else None
+    candidates = [known] if known else []
+    candidates += [o for o in [page_root] + list(_PTV_ORIGIN_FALLBACKS) if o not in candidates]
+    last = None
+    for i, o in enumerate(candidates):
+        r = requests.get(url, headers={'User-Agent': UA, 'Origin': o, 'Referer': referer},
+                         timeout=timeout)
+        if r.status_code != 403:
+            if cdn_host and o != known:
+                with _ptv_origin_lock:
+                    _ptv_good_origin[cdn_host] = o
+                log(f'[PremiumTV] {cdn_host} accepte Origin {o}')
+            return r.status_code, r.content, r.url, r.headers
+        last = r
+        log(f'[PremiumTV] HTTP 403 avec Origin {o}' + (f' sur {url[:56]}' if i == 0 else ''))
+    return last.status_code, last.content, last.url, last.headers
+
+
 
 class _EPlayerProxyHandler(BaseHTTPRequestHandler):
     """Local HTTP proxy that:
@@ -2557,11 +2613,15 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
-            hdrs = _proxy_headers(origin)
+            _cdn_host = urlparse(raw_url).hostname or ''
+            _code, _body, _final, _rh = _ptv_fetch(raw_url, origin, _cdn_host, timeout=5)
+            hdrs = {'Referer': origin if '?' in origin else origin.rstrip('/') + '/'}
             referer = hdrs['Referer']
 
             # Fetch without streaming so we can inspect Content-Type / content prefix
-            r = requests.get(raw_url, headers=hdrs, timeout=5)
+            r = type('R', (), {'status_code': _code, 'content': _body,
+                               'text': _body.decode('utf-8', 'replace'),
+                               'url': _final, 'headers': _rh})()
             ct = r.headers.get('Content-Type', '')
 
             # Detect M3U8 by URL extension OR Content-Type OR content starting with #EXTM3U
@@ -2645,10 +2705,14 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
-            hdrs = _proxy_headers(origin)
+            _cdn_host = urlparse(raw_url).hostname or ''
+            _code, _body, _final, _rh = _ptv_fetch(raw_url, origin, _cdn_host)
+            hdrs = {'Referer': origin if '?' in origin else origin.rstrip('/') + '/'}
             referer = hdrs['Referer']
-
-            r = requests.get(raw_url, headers=hdrs, timeout=8)
+            _R = type('R', (), {'status_code': _code, 'content': _body,
+                                'text': _body.decode('utf-8', 'replace'),
+                                'url': _final, 'headers': _rh})()
+            r = _R
             if r.status_code != 200:
                 log(f'[PremiumTVProxy] m3u8 HTTP {r.status_code}: {raw_url[:80]}')
                 self.send_response(502)
@@ -5922,9 +5986,12 @@ def _placeholder_stream(manifest_url, referer=None, timeout=6):
     "Error creating demuxer" because ffmpeg is handed PNG bytes."""
     try:
         sess = _get_session()
-        hdrs = {'User-Agent': UA}
-        if referer:
-            hdrs['Referer'] = referer
+        # Same headers as the proxy will use: a pre-flight that sends less can pass
+        # on a request the proxy will then have refused, which is exactly how DLTV
+        # ended up reporting "backend OK" and Kodi dying on "Error creating demuxer".
+        hdrs = _ptv_headers(referer or '', urlparse(manifest_url).hostname or '')
+        if not referer:
+            hdrs.pop('Referer', None)
         m = sess.get(manifest_url, headers=hdrs, timeout=timeout)
         if m.status_code != 200 or not m.text.lstrip().startswith('#EXTM3U'):
             return False
