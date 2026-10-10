@@ -1,4 +1,4 @@
-# version: 1.2.43 (doit correspond à addon.xml)
+# version: 1.2.44 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -165,6 +165,7 @@ _SEQ_RX = re.compile(r'#EXT-X-MEDIA-SEQUENCE:(\d+)')
 _FAV_PROBE_TS_FILE = os.path.join(_KODI_TEMP, 'dltv_fav_probe_ts')
 _PAGE_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_page_cache.json')
 _FAILED_KEY = '__failed_urls'   # failure marks live in the same file, separate key
+_PORTAL_KEY = '__portal_quota'  # TCP-connection budget, same file
 
 
 def _aes128_cbc_decrypt(data, key, iv):
@@ -3369,6 +3370,104 @@ _fetch_failed = {}             # url -> timestamp, mirrored to disk on every fai
 _fetch_fail_lock = threading.Lock()
 _FETCH_FAIL_TTL = 60          # seconds to stop retrying a URL that just failed
 
+# The portal counts TCP connections per IP, not requests per unit of time: measured
+# from one host, 19 successive connections answered 200 OK and connection #20 came
+# back ECONNREFUSED, then every later connection too — including channels that had
+# just been playing. The block expires on its own (200 OK again five minutes later),
+# and a VPN lifts it immediately because it changes the source IP.
+#
+# Every extra connection therefore spends part of a budget of ~19 for the whole
+# session, not just for one channel. Three things used to burn it needlessly:
+# get_active_base probed the portal twice per attempt, the health probe ran even
+# when the slug cache made the portal unnecessary, and AnyPlayer walked seven pages
+# when the portal was refusing. This counter keeps the account across Kodi restarts,
+# since each menu entry is a fresh interpreter.
+_portal_state = {}            # {'refusals': int, 'until': ts, 'seen': int}
+_portal_state_lock = threading.Lock()
+_PORTAL_QUOTA = 15            # stay under the measured ceiling of 19
+_PORTAL_REFUSAL_LIMIT = 3     # consecutive refusals before standing down
+_PORTAL_QUARANTINE = 300      # seconds offline once the limit is reached
+
+
+def _load_portal_state():
+    try:
+        with open(_PAGE_CACHE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        st = data.get(_PORTAL_KEY) if isinstance(data, dict) else None
+        if isinstance(st, dict):
+            return {'refusals': int(st.get('refusals', 0)),
+                    'until': float(st.get('until', 0)),
+                    'seen': int(st.get('seen', 0))}
+    except Exception:
+        pass
+    return {'refusals': 0, 'until': 0, 'seen': 0}
+
+
+def _save_portal_state(st):
+    try:
+        with open(_PAGE_CACHE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[_PORTAL_KEY] = st
+    _dir = os.path.dirname(_PAGE_CACHE_FILE)
+    fd, tmp_path = tempfile.mkstemp(dir=_dir)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        os.replace(tmp_path, _PAGE_CACHE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _portal_offline():
+    """True when the portal is quarantined: it refused us repeatedly and the block
+    has not expired. Talking to it again would only spend connections we do not
+    have — the measured budget is 19 for the whole session."""
+    with _portal_state_lock:
+        st = _load_portal_state()
+    return st['until'] > time.time()
+
+
+def _portal_note_contact():
+    """A portal connection that reached the application layer: the block is not up."""
+    with _portal_state_lock:
+        st = _load_portal_state()
+        st['refusals'] = 0
+        st['seen'] = st.get('seen', 0) + 1
+        if st['until'] and st['until'] <= time.time():
+            st['until'] = 0
+        _save_portal_state(st)
+
+
+def _portal_note_refusal(reason=''):
+    """TCP refused. Count it, and stand down for a few minutes once it is clear the
+    quota is spent — retrying the channels that just worked only burns the rest."""
+    with _portal_state_lock:
+        st = _load_portal_state()
+        st['refusals'] = st.get('refusals', 0) + 1
+        if st['refusals'] >= _PORTAL_REFUSAL_LIMIT:
+            st['until'] = time.time() + _PORTAL_QUARANTINE
+            log(f'[PortalQuota] {st["refusals"]} refus consecutifs — portail mis en '
+                f'quarantaine {_PORTAL_QUARANTINE}s (le compteur TCP du site est '
+                f'epuise ; ~{_PORTAL_QUOTA} connexions tolerees par session)')
+        _save_portal_state(st)
+
+
+def _portal_refusals():
+    with _portal_state_lock:
+        return _load_portal_state().get('refusals', 0)
+
+
+def _portal_reset():
+    with _portal_state_lock:
+        _save_portal_state({'refusals': 0, 'until': 0, 'seen': 0})
+
 
 def _load_failed_urls():
     """Read the failure marks written by a previous Kodi invocation.
@@ -3458,16 +3557,28 @@ def fetch_via_proxy(url, headers=None, use_cache=True):
     resp_text = ''
     for attempt in range(2):
         for verify_ssl in ([True, False] if attempt == 0 else [False]):
+            if _portal_offline():
+                # Quarantined: the site's connection counter is spent. Retrying would
+                # spend connections the session does not have left.
+                _stale = ''
+                if should_cache:
+                    _e = _load_page_cache().get(url)
+                    if isinstance(_e, dict):
+                        _stale = _e.get('data', '') or ''
+                log(f'[fetch_via_proxy] portail en quarantaine, cache servi pour {url[:52]}')
+                return _stale
             if not verify_ssl:
                 log(f'[fetch_via_proxy] SSL verify disabled for retry: {url[:60]}')
             try:
                 resp_text = requests.get(url, headers=headers, timeout=8,
                                          verify=verify_ssl, allow_redirects=True).text
                 if not _is_error_response(resp_text, url):
+                    _portal_note_contact()
                     log(f"[fetch_via_proxy] ok attempt={attempt} verify={verify_ssl} for {url}")
                     break
                 log(f"[fetch_via_proxy] bad response verify={verify_ssl}: {resp_text[:80]}")
             except Exception as e:
+                _portal_note_refusal('fetch_via_proxy')
                 log(f"[fetch_via_proxy] failed attempt={attempt} verify={verify_ssl} for {url}: {type(e).__name__}: {e}")
         if not _is_error_response(resp_text, url):
             break
@@ -6493,11 +6604,12 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
         _wide_fresh_token(w_slug, w_token)
         _ensure_m3u8_proxy()
         # The wideiptv CDN nodes go down regularly (ds164.bluetier.top started
-        # refusing TCP). Probe it first and fall back to the premiumtv direct HLS
-        # instead of letting Kodi fail with a bare "Error creating demuxer".
-        if not _cdn_reachable(w_url, referer=f'https://wideiptv.top/player/{w_slug}',
-                                  timeout=5, attempts=4) or \
-           not _wide_probe(w_url, w_slug):
+        # refusing TCP). _wide_probe already walks manifest → media playlist →
+        # first segment and checks the bytes are MPEG-TS, which tells us strictly
+        # more than _cdn_reachable's single manifest GET. Keeping both meant two
+        # round trips to the same host for the same verdict, and connections are
+        # the scarce resource here — hence one probe, not two.
+        if not _wide_probe(w_url, w_slug):
             log(f'[PlayStream] wideiptv CDN unreachable — falling back to premiumtv direct HLS')
             direct_url, direct_ref = get_direct_hls_url(channel_id)
             if not direct_url:
@@ -6655,6 +6767,14 @@ def PlayStream(link):
             if _cdn == '__wideiptv__' and not _wide_slug_cached(channel_id) \
                     and _portal_unreachable():
                 log('[PlayStream] skipping wideiptv — portal unreachable and no cached slug')
+                continue
+            if _cdn != '__wideiptv__' and _portal_offline():
+                # The portal's connection budget is spent (measured: ~19 connections
+                # per session, then ECONNREFUSED for everything including channels
+                # that were just playing). Retrying now would only lock out what
+                # still works; the quarantine expires on its own.
+                log(f'[PlayStream] skipping {_label} — portail en quarantaine '
+                    f'(quota de connexions epuise)')
                 continue
             log(f'[PlayStream] trying backend: {_label}')
             _res = _resolve_playback(channel_id, channel_key, _cdn)
