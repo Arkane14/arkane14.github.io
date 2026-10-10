@@ -1,4 +1,4 @@
-# version: 1.2.47 (doit correspond à addon.xml)
+# version: 1.2.48 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -3725,6 +3725,15 @@ def get_active_base():
     global _active_base_cache, _active_base_failed_at
     if _active_base_cache:
         return _active_base_cache
+    # Connections, not requests, are what the portal counts, and the budget is ~19
+    # for a whole session. Standing down when it is refusing beats spending the rest
+    # of it: every retry comes back ECONNREFUSED and locks out channels that worked.
+    if _portal_offline():
+        base = normalize_origin(SEED_BASEURL)
+        if not base.endswith('/'):
+            base += '/'
+        _active_base_cache = base
+        return base
     # A portal that just refused connections must not be re-probed on every single
     # call: a directory rebuild asks for the base once per URL, and each probe costs
     # a full timeout. Remember the failure briefly and reuse the fallback instead.
@@ -3742,8 +3751,10 @@ def get_active_base():
                              verify=False, allow_redirects=True)
             if r.status_code >= 400:
                 raise Exception(f'HTTP {r.status_code}')
+            _portal_note_contact()
         except Exception as e:
             log(f'[get_active_base] {base} invalide ({e}), reset vers seed')
+            _portal_note_refusal('get_active_base')
             base = ''
             _active_base_failed_at = time.time()
             _save_portal_base('')
@@ -5683,18 +5694,27 @@ def _try_player_page(channel_id, player_url, watch_url, sess):
         return None
 
     except Exception as e:
+        # A refused portal means the connection budget is gone; this is one of the
+        # requests that spent it, so it has to be counted or the quota never fills.
+        _portal_note_refusal('anyplayer')
         log(f'[AnyPlayer] error for {player_url}: {e}')
         return None
 
 
-def _portal_unreachable(window=6.0):
+def _portal_unreachable(window=None):
     """True when the portal just refused us recently.
 
     get_active_base probes the portal on its first call and remembers failure for
     _ACTIVE_BASE_FAIL_TTL, so this reads that state instead of spending another
-    connection on every check."""
+    connection on every check. The window defaults to that TTL rather than to six
+    seconds: a refused portal took 24 s to work down to AnyPlayer in the log, and a
+    six-second window had already expired by then, so the walk went on through all
+    seven player pages — 56 s spent rediscovering what the first probe had proven."""
+    if _portal_offline():
+        return True
+    w = _ACTIVE_BASE_FAIL_TTL if window is None else window
     return bool(_active_base_failed_at and
-                time.time() - _active_base_failed_at < window)
+                time.time() - _active_base_failed_at < w)
 
 
 def get_any_player_stream(channel_id):
@@ -5834,9 +5854,11 @@ def get_direct_hls_url(channel_id):
                         break
         except Exception as e:
             log(f'[DirectHls] variant resolution skipped: {e}')
+        _portal_note_contact()
         log(f'[DirectHls] OK ({channel_id}): {hls_url[:100]}')
         return hls_url, watch_url
     except Exception as e:
+        _portal_note_refusal('directhls')
         log(f'[DirectHls] error for id={channel_id}: {e}')
         return None, None
 
@@ -6615,6 +6637,8 @@ def get_wideiptv_url(channel_id):
             pass  # reachability is not this check's job; the proxy retries anyway
         return stream_url, slug, token
     except Exception as e:
+        # Slug lookups go through the portal, so this is a spent connection too.
+        _portal_note_refusal('wideiptv')
         log(f'[WideIptv] error for id={channel_id}: {e}')
         return None
 
