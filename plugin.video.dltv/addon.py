@@ -1,4 +1,4 @@
-# version: 1.2.52 (doit correspond à addon.xml)
+# version: 1.2.53 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -1473,6 +1473,65 @@ def _unwrap_ptv_segment(body):
     return ts
 
 
+_ptv_flight_lock = threading.Lock()
+_ptv_flight = {}            # segment key -> threading.Event (None once available)
+
+
+def _ptv_fetch_segment(key, url, origin):
+    """Download + unwrap a premiumtv segment, one download at a time.
+
+    The prefetch and the serving path were both fetching the same opening segment
+    over separate connections at the same moment. On a 0.06-0.7 Mo/s link that halved
+    an already thin bandwidth, and Kodi's 30 s give-up expired while the duplicate was
+    still in flight — the segment arrived 25 s after the player had given up. Now the
+    first caller downloads and everybody else waits for its result."""
+
+    cached = _ptv_cache_get(key)
+    if cached is not None:
+        return cached
+
+    def _download():
+        host = urlparse(url).hostname or ''
+        code, body, _final, _hdrs = _ptv_fetch(url, origin, host,
+                                                timeout=_PTV_SEGMENT_TIMEOUT)
+        if code != 200 or not body:
+            return None
+        ts = _unwrap_ptv_segment(body) if body[:2] == b'\x89P' else body
+        if ts:
+            _ptv_cache_store(key, ts)
+        return ts
+
+    with _ptv_flight_lock:
+        ev = _ptv_flight.get(key)
+        owner = ev is None
+        if owner:
+            ev = threading.Event()
+            _ptv_flight[key] = ev
+    if not owner:
+        # Someone else is already fetching this exact segment: wait for their bytes
+        # rather than opening a second connection for the same payload.
+        ev.wait(timeout=_PTV_SEGMENT_TIMEOUT + 10)
+        return _ptv_cache_get(key)
+    try:
+        return _download()
+    finally:
+        with _ptv_flight_lock:
+            _ptv_flight.pop(key, None)
+        ev.set()
+
+
+def _ptv_await_segment(key, timeout):
+    """Return the bytes of a segment another thread is already downloading, or None
+    when nobody owns it. The caller then keeps what it downloaded itself instead of
+    paying for the payload twice."""
+    with _ptv_flight_lock:
+        ev = _ptv_flight.get(key)
+    if ev is None:
+        return None
+    ev.wait(timeout=timeout)
+    return _ptv_cache_get(key)
+
+
 def _ptv_prefetch(urls, origin):
     """Fetch and unwrap the first segments before inputstream.adaptive asks for them.
 
@@ -1486,21 +1545,15 @@ def _ptv_prefetch(urls, origin):
         key = u.split('?', 1)[0]
         if _ptv_cache_get(key) is not None:
             return
+        t0 = time.time()
         try:
-            host = urlparse(u).hostname or ''
-            code, body, _final, _hdrs = _ptv_fetch(u, origin_page, host,
-                                                    timeout=_PTV_SEGMENT_TIMEOUT)
+            ts = _ptv_fetch_segment(key, u, origin_page)
         except Exception as e:
             log(f'[PremiumTVPrefetch] {type(e).__name__} sur {u[-40:]}')
             return
-        if code != 200 or not body:
-            return
-        t0 = time.time()
-        ts = _unwrap_ptv_segment(body)
         if ts:
-            _ptv_cache_store(key, ts)
-            log(f'[PremiumTVPrefetch] segment {len(body)}B -> {len(ts)}B '
-                f'precharge en {(time.time() - t0) * 1000:.0f} ms')
+            log(f'[PremiumTVPrefetch] segment {len(ts)}B precharge en '
+                f'{(time.time() - t0) * 1000:.0f} ms')
 
     def _run():
         for u in urls:
@@ -2770,13 +2823,25 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                         body = ts
                         ct_out = 'video/MP2T'
                     else:
+                        # A prefetch may already be pulling this exact segment.
+                        # Waiting for it beats holding two copies of a 3 MB payload
+                        # on a link measured at 0.06-0.7 Mo/s, which is how the first
+                        # segment used to arrive 25 s after Kodi had given up.
                         _t0 = time.time()
-                        ts = _unwrap_ptv_segment(body)
+                        _body_len = len(body)
+                        _waited = _ptv_await_segment(_ckey, _PTV_SEGMENT_TIMEOUT)
+                        if _waited is not None:
+                            ts = _waited
+                            log(f'[PremiumTVProxy] segment servi depuis le prefetch '
+                                f'({len(ts)}B, {int((time.time() - _t0) * 1000)} ms)')
+                        else:
+                            ts = _unwrap_ptv_segment(body)
                         _ms = (time.time() - _t0) * 1000
                         if ts:
-                            log(f'[PremiumTVProxy] unwrapped PNG envelope '
-                                f'{len(body)}B -> MPEG-TS {len(ts)}B in {_ms:.0f} ms')
-                            _ptv_cache_store(_ckey, ts)
+                            if _waited is None:
+                                log(f'[PremiumTVProxy] unwrapped PNG envelope '
+                                    f'{_body_len}B -> MPEG-TS {len(ts)}B in {_ms:.0f} ms')
+                                _ptv_cache_store(_ckey, ts)
                             body = ts
                             ct_out = 'video/MP2T'
                         else:
