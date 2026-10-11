@@ -1,4 +1,4 @@
-# version: 1.2.53 (doit correspond à addon.xml)
+# version: 1.2.54 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -49,6 +49,31 @@ _KODI_TEMP = xbmcvfs.translatePath('special://temp/')
 # settings are not the place to keep anything that must not be lost. Every write goes
 # through _set_setting() from now on.
 _SETTINGS_LOCK = threading.RLock()
+
+# Kodi gives a Python script five seconds to stop and then kills the interpreter,
+# which shows up as "script didn't stop in 5 seconds" followed by an ignored
+# SystemExit out of threading._shutdown(). The add-on is usually mid-network at that
+# moment — fetch_via_proxy alone can sit in two 8 s attempts — so it has to notice
+# the shutdown and unwind instead of being cut off.
+_abort_monitor = None
+_abort_lock = threading.Lock()
+
+
+def _shutting_down():
+    """True once Kodi has begun stopping."""
+    global _abort_monitor
+    with _abort_lock:
+        if _abort_monitor is None:
+            try:
+                _abort_monitor = xbmc.Monitor()
+            except Exception:
+                _abort_monitor = False
+    if not _abort_monitor:
+        return False
+    try:
+        return bool(_abort_monitor.abortRequested())
+    except Exception:
+        return False
 _FAV_FILE = os.path.join(_KODI_TEMP, 'dltv_favorites.json')
 _EXTRA_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_extra_channels.json')
 
@@ -1501,6 +1526,12 @@ def _ptv_fetch_segment(key, url, origin):
             _ptv_cache_store(key, ts)
         return ts
 
+    if _shutting_down():
+        # Same reason as in fetch_via_proxy: Kodi kills the interpreter five seconds
+        # after asking it to stop, and a fresh multi-megabyte download is exactly
+        # what would still be running when that happens.
+        return _ptv_cache_get(key)
+
     with _ptv_flight_lock:
         ev = _ptv_flight.get(key)
         owner = ev is None
@@ -1528,7 +1559,13 @@ def _ptv_await_segment(key, timeout):
         ev = _ptv_flight.get(key)
     if ev is None:
         return None
-    ev.wait(timeout=timeout)
+    while True:
+        # Bounded wait that still returns as soon as the fetch lands, but gives up
+        # immediately once Kodi starts shutting down.
+        if ev.wait(0.25):
+            break
+        if _shutting_down():
+            return _ptv_cache_get(key)
     return _ptv_cache_get(key)
 
 
@@ -3783,6 +3820,13 @@ def _save_failed_urls(marks):
         log(f'[fetch_via_proxy] failed-mark save skipped: {type(e).__name__}')
 
 
+def _stale_cache_for(url, should_cache):
+    if not should_cache:
+        return ''
+    e = _load_page_cache().get(url)
+    return e.get('data', '') if isinstance(e, dict) else ''
+
+
 def fetch_via_proxy(url, headers=None, use_cache=True):
     global _fetch_failed
     headers = headers or {}
@@ -3818,6 +3862,12 @@ def fetch_via_proxy(url, headers=None, use_cache=True):
     resp_text = ''
     for attempt in range(2):
         for verify_ssl in ([True, False] if attempt == 0 else [False]):
+            if _shutting_down():
+                # Kodi is closing and will kill this interpreter in five seconds;
+                # starting another eight-second request here is what turns a clean
+                # exit into "script didn't stop in 5 seconds".
+                log(f'[fetch_via_proxy] abandon, arret de Kodi en cours ({url[:44]})')
+                return _stale_cache_for(url, should_cache)
             if _portal_offline():
                 # Quarantined: the site's connection counter is spent. Retrying would
                 # spend connections the session does not have left.
