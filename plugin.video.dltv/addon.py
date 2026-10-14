@@ -1,4 +1,4 @@
-# version: 1.2.55 (doit correspond à addon.xml)
+# version: 1.2.56 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -1502,6 +1502,29 @@ _ptv_flight_lock = threading.Lock()
 _ptv_flight = {}            # segment key -> threading.Event (None once available)
 
 
+def _ptv_download(url, origin):
+    """Fetch one premiumtv segment, still wrapped. No decoding here: the unwrap is
+    ~3 s of Python on a tablet, and stacking it on top of the download is what makes
+    a 5.76 s segment take 11 s of wall clock."""
+    host = urlparse(url).hostname or ''
+    try:
+        code, body, _final, _hdrs = _ptv_fetch(url, origin, host,
+                                                timeout=_PTV_SEGMENT_TIMEOUT)
+    except Exception as e:
+        log(f'[PremiumTV] {type(e).__name__} sur {url[-44:]}')
+        return None
+    return body if code == 200 and body else None
+
+
+def _ptv_decode(key, body):
+    """Unwrap an already-downloaded segment and put it in the cache."""
+    t0 = time.time()
+    ts = _unwrap_ptv_segment(body) if body[:2] == b'\x89P' else body
+    if ts:
+        _ptv_cache_store(key, ts)
+    return ts
+
+
 def _ptv_fetch_segment(key, url, origin):
     """Download + unwrap a premiumtv segment, one download at a time.
 
@@ -1516,15 +1539,10 @@ def _ptv_fetch_segment(key, url, origin):
         return cached
 
     def _download():
-        host = urlparse(url).hostname or ''
-        code, body, _final, _hdrs = _ptv_fetch(url, origin, host,
-                                                timeout=_PTV_SEGMENT_TIMEOUT)
-        if code != 200 or not body:
+        body = _ptv_download(url, origin)
+        if body is None:
             return None
-        ts = _unwrap_ptv_segment(body) if body[:2] == b'\x89P' else body
-        if ts:
-            _ptv_cache_store(key, ts)
-        return ts
+        return _ptv_decode(key, body)
 
     if _shutting_down():
         # Same reason as in fetch_via_proxy: Kodi kills the interpreter five seconds
@@ -1616,14 +1634,18 @@ def _ptv_prefetch_start(urls, origin):
         if _ptv_cache_get(key) is not None:
             return
         t0 = time.time()
-        try:
-            ts = _ptv_fetch_segment(key, u, origin_page)
-        except Exception as e:
-            log(f'[PremiumTVPrefetch] {type(e).__name__} sur {u[-40:]}')
+        # Download and decode on separate threads. The measured pipeline on the
+        # tablet was 4.5 s of transfer plus 3 s of Python unwrap; run in series that
+        # is 7.5 s for a 5.76 s segment, which is why the high-bitrate channels
+        # drifted and the others did not. Overlapped, it is max(4.5, 3).
+        body = _ptv_download(u, origin_page)
+        if body is None:
             return
+        t1 = time.time()
+        ts = _ptv_decode(key, body)
         if ts:
-            log(f'[PremiumTVPrefetch] segment {len(ts)}B precharge en '
-                f'{(time.time() - t0) * 1000:.0f} ms')
+            log(f'[PremiumTVPrefetch] segment {len(ts)}B '
+                f'{(t1 - t0) * 1000:.0f} ms + {(time.time() - t1) * 1000:.0f} ms')
 
     def _run():
         try:
