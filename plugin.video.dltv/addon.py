@@ -1,4 +1,4 @@
-# version: 1.2.54 (doit correspond à addon.xml)
+# version: 1.2.55 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -1569,7 +1569,40 @@ def _ptv_await_segment(key, timeout):
     return _ptv_cache_get(key)
 
 
+_ptv_prefetch_busy = False
+_ptv_prefetch_lock = threading.Lock()
+
+
 def _ptv_prefetch(urls, origin):
+    """Pull the next segment ahead of ISA — one at a time, and only if it helps.
+
+    On the Android tablet this ran once per playlist refresh with two segments each.
+    A download that took 20 s was therefore still running when the next refresh
+    started, so several multi-megabyte fetches shared the tablet's uplink, the
+    request ISA actually cared about ran out of bandwidth, and curl timed out waiting
+    on our own proxy: "FillBuffer - Timeout was reached" followed by broken pipes.
+    One segment, one thread, and a skip when the work is already covered."""
+    global _ptv_prefetch_busy
+    wanted = []
+    for u in urls:
+        key = u.split('?', 1)[0]
+        if _ptv_cache_get(key) is not None:
+            continue
+        with _ptv_flight_lock:
+            if key in _ptv_flight:
+                continue
+        wanted.append(u)
+    if not wanted:
+        return
+    with _ptv_prefetch_lock:
+        if _ptv_prefetch_busy:
+            log('[PremiumTVPrefetch] deja en cours, segment ignore')
+            return
+        _ptv_prefetch_busy = True
+    _ptv_prefetch_start(wanted[:1], origin)
+
+
+def _ptv_prefetch_start(urls, origin):
     """Fetch and unwrap the first segments before inputstream.adaptive asks for them.
 
     The cache used to fill only *after* ISA requested a segment, so the first one
@@ -1593,8 +1626,13 @@ def _ptv_prefetch(urls, origin):
                 f'{(time.time() - t0) * 1000:.0f} ms')
 
     def _run():
-        for u in urls:
-            _one(u, origin)
+        try:
+            for u in urls:
+                _one(u, origin)
+        finally:
+            global _ptv_prefetch_busy
+            with _ptv_prefetch_lock:
+                _ptv_prefetch_busy = False
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
