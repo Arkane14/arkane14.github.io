@@ -1,4 +1,4 @@
-# version: 1.2.62 (doit correspond à addon.xml)
+# version: 1.2.63 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -94,9 +94,9 @@ def _heal_settings_file():
         if os.path.getsize(path) > 0:
             return
         os.remove(path)
-        log('[settings] settings.xml vide supprime — Kodi va le recreer')
+        log('[settings] empty settings.xml removed — Kodi will recreate it')
     except Exception as e:
-        log(f'[settings] verification impossible ({type(e).__name__})')
+        log(f'[settings] cannot verify ({type(e).__name__})')
 _EXTRA_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_extra_channels.json')
 
 
@@ -1385,7 +1385,7 @@ def _refresh_channel_creds(cid, max_attempts=3):
     if direct_url:
         log(f'[EPlayerAuth] using new-format direct m3u8 for {channel_key}')
         _set_channel_state(channel_key, 'noauth', 'noauth', direct_url, player_referer=pref)
-        # Réinitialiser les compteurs de stall/timeout qui causent les saccades
+        # Reset the stall/timeout counters that cause the stuttering
         with _stall_lock:
             _m3u8_stall.pop(channel_key, None)
             _m3u8_timeouts.pop(channel_key, None)
@@ -1533,7 +1533,7 @@ def _ptv_download(url, origin):
         code, body, _final, _hdrs = _ptv_fetch(url, origin, host,
                                                 timeout=_PTV_SEGMENT_TIMEOUT)
     except Exception as e:
-        log(f'[PremiumTV] {type(e).__name__} sur {url[-44:]}')
+        log(f'[PremiumTV] {type(e).__name__} on {url[-44:]}')
         return None
     return body if code == 200 and body else None
 
@@ -1636,7 +1636,7 @@ def _ptv_prefetch(urls, origin):
         return
     with _ptv_prefetch_lock:
         if _ptv_prefetch_busy:
-            log('[PremiumTVPrefetch] deja en cours, segment ignore')
+            log('[PremiumTVPrefetch] already running, segment skipped')
             return
         _ptv_prefetch_busy = True
     _ptv_prefetch_start(wanted[:1], origin)
@@ -1771,18 +1771,18 @@ def _ptv_fetch(url, origin, cdn_host='', timeout=8):
             # could play. Losing a slow segment to a timeout helps nobody.
             last = None
             if i < len(candidates) - 1:
-                log(f'[PremiumTV] {type(e).__name__} avec Origin {o}, essai suivant')
+                log(f'[PremiumTV] {type(e).__name__} with Origin {o}, trying next')
                 continue
-            log(f'[PremiumTV] {type(e).__name__} sur {url[:56]}')
+            log(f'[PremiumTV] {type(e).__name__} on {url[:56]}')
             raise
         if r.status_code != 403:
             if cdn_host and o != known:
                 with _ptv_origin_lock:
                     _ptv_good_origin[cdn_host] = o
-                log(f'[PremiumTV] {cdn_host} accepte Origin {o}')
+                log(f'[PremiumTV] {cdn_host} accepts Origin {o}')
             return r.status_code, r.content, r.url, r.headers
         last = r
-        log(f'[PremiumTV] HTTP 403 avec Origin {o}' + (f' sur {url[:56]}' if i == 0 else ''))
+        log(f'[PremiumTV] HTTP 403 with Origin {o}' + (f' on {url[:56]}' if i == 0 else ''))
     if last is None:
         raise IOError(f'premiumtv unreachable: {url[:70]}')
     return last.status_code, last.content, last.url, last.headers
@@ -2966,7 +2966,7 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                         _waited = _ptv_await_segment(_ckey, _PTV_SEGMENT_TIMEOUT)
                         if _waited is not None:
                             ts = _waited
-                            log(f'[PremiumTVProxy] segment servi depuis le prefetch '
+                            log(f'[PremiumTVProxy] segment served from the prefetch '
                                 f'({len(ts)}B, {int((time.time() - _t0) * 1000)} ms)')
                         else:
                             ts = _unwrap_ptv_segment(body)
@@ -3020,8 +3020,8 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 if _body is None:
                     _body = _ptv_stale_manifest(raw_url)
                     if _body:
-                        log('[PremiumTVProxy] CDN refuse le manifeste — '
-                            'dernier manifeste connu servi')
+                        log('[PremiumTVProxy] CDN refused the manifest — '
+                            'last known manifest served')
                 _code = 200 if _body else 502
                 _final, _rh = raw_url, {}
             else:
@@ -3868,9 +3868,9 @@ def _portal_note_refusal(reason=''):
         st['refusals'] = st.get('refusals', 0) + 1
         if st['refusals'] >= _PORTAL_REFUSAL_LIMIT:
             st['until'] = time.time() + _PORTAL_QUARANTINE
-            log(f'[PortalQuota] {st["refusals"]} refus consecutifs — portail mis en '
-                f'quarantaine {_PORTAL_QUARANTINE}s (le compteur TCP du site est '
-                f'epuise ; ~{_PORTAL_QUOTA} connexions tolerees par session)')
+            log(f'[PortalQuota] {st["refusals"]} consecutive refusals — portal '
+                f'quarantined for {_PORTAL_QUARANTINE}s (the site counts TCP '
+                f'connections; about {_PORTAL_QUOTA} are allowed per session)')
         _save_portal_state(st)
 
 
@@ -3993,7 +3993,7 @@ def fetch_via_proxy(url, headers=None, use_cache=True):
                     _e = _load_page_cache().get(url)
                     if isinstance(_e, dict):
                         _stale = _e.get('data', '') or ''
-                log(f'[fetch_via_proxy] portail en quarantaine, cache servi pour {url[:52]}')
+                log(f'[fetch_via_proxy] portal quarantined, cached page served for {url[:52]}')
                 return _stale
             if not verify_ssl:
                 log(f'[fetch_via_proxy] SSL verify disabled for retry: {url[:60]}')
@@ -4662,7 +4662,7 @@ def toggle_favorite(cid, name):
 
 
 _KNOWN_CDNS = [
-    ('Direct HLS (premiumtv, envelopes PNG deballées)', '__premiumtv__'),
+    ('Direct HLS (premiumtv, PNG envelopes unwrapped)', '__premiumtv__'),
     ('Direct HLS (wideiptv)',  '__wideiptv__'),
     ('Direct HLS (wideiptv)',  '__wideiptv__'),
     ('Auto — Player direct',  '__anyplayer__'),
@@ -4815,7 +4815,7 @@ _NAME_TO_LANG = {
     'norway': 'nor',
     'denmark': 'dan',
     'finland': 'fin',
-    # Noms de pays manquants (formes substantif)
+    # Missing country names (substantive forms)
     'bulgaria': 'bul',
     'serbia': 'srp',
     'croatia': 'hrv',
@@ -4843,7 +4843,7 @@ _NAME_TO_LANG = {
     'sudan': 'ara',
     'yemen': 'ara',
     # French country names (Canal+/beIN channels)
-    'afrique': 'fra',   # Canal+ Sport Afrique → français
+    'afrique': 'fra',   # Canal+ Sport Afrique -> French
 }
 
 # Pass 1 — 2-letter ISO codes, checked ONLY as the last word of the name
@@ -4930,7 +4930,7 @@ def _lookup_lang(name, index):
     """Return the language code for a channel.
     Pass 1: detection from name words (explicit country/language).
     Pass 2: lookup in iptv-org index with progressive normalizations."""
-    # Pass 1 — nom seul, sans index
+    # Pass 1 - name only, without the index
     lang = _lang_from_name(name)
     if lang:
         return lang
@@ -5771,7 +5771,7 @@ def _try_player_page(channel_id, player_url, watch_url, sess):
             if any(skip in iframe_url for skip in _AP_SKIP_HOSTS) or '/premiumtv/' in iframe_url:
                 continue
             if iframe_url in _seen_iframes:
-                log(f'[AnyPlayer] iframe deja scanne, ignore: {iframe_url[:60]}')
+                log(f'[AnyPlayer] iframe already scanned, skipped: {iframe_url[:60]}')
                 continue
             _seen_iframes.add(iframe_url)
             log(f'[AnyPlayer] scanning iframe: {iframe_url[:80]}')
@@ -6200,7 +6200,7 @@ def get_direct_hls_url(channel_id):
     short-lived playlist token the player fetches from {EDGE}/api/playlist-token."""
     _cached_url, _cached_player = _resolved_get(channel_id)
     if _cached_url:
-        log(f'[DirectHls] resolution en cache pour {channel_id} — aucune requete portail')
+        log(f'[DirectHls] resolution cached for {channel_id} — no portal request')
         return _cached_url, _cached_player
     try:
         watch_url = abs_url(f'watch.php?id={channel_id}')
@@ -6487,11 +6487,11 @@ def _guess_premiumtv_url(channel_id, timeout=6):
         _ptv_guess_ok[channel_id] = False
         return None, None
     if code != 200 or body[:7] != b'#EXTM3U':
-        log(f'[PremiumTVGuess] premium{channel_id} HTTP {code} — non utilise')
+        log(f'[PremiumTVGuess] premium{channel_id} HTTP {code} — not used')
         _ptv_guess_ok[channel_id] = False
         return None, None
     _ptv_guess_ok[channel_id] = True
-    log(f'[PremiumTVGuess] premium{channel_id} resolu sans le portail : {url}')
+    log(f'[PremiumTVGuess] premium{channel_id} resolved without the portal: {url}')
     return url, origin
 
 
@@ -6546,13 +6546,13 @@ def _ptv_playlist_token(manifest_url, player_page_url, timeout=8, force=False):
         r = requests.get(f'https://{host}/api/playlist-token?slug={quote_plus(slug)}',
                          headers=headers, timeout=timeout)
         if r.status_code != 200:
-            log(f'[PremiumTV] playlist-token HTTP {r.status_code} pour {slug}')
+            log(f'[PremiumTV] playlist-token HTTP {r.status_code} for {slug}')
             return ''
         data = r.json()
         token = data.get('token') or ''
         ttl = max(20.0, float(data.get('ttl') or 120))
     except Exception as e:
-        log(f'[PremiumTV] playlist-token indisponible ({type(e).__name__})')
+        log(f'[PremiumTV] playlist-token unavailable ({type(e).__name__})')
         return ''
     if not token:
         return ''
@@ -6598,17 +6598,17 @@ def _ptv_fetch_manifest(manifest_url, player_page_url, timeout=8):
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
         except Exception as e:
-            log(f'[PremiumTV] manifeste inaccessible ({type(e).__name__})')
+            log(f'[PremiumTV] manifest inaccessible ({type(e).__name__})')
             return None
         if r.status_code == 200 and r.content[:7] == b'#EXTM3U':
             with _ptv_manifest_lock:
                 _ptv_manifest_cache[manifest_url] = (r.content, time.time())
             return r.content
         if r.status_code != 403:
-            log(f'[PremiumTV] manifeste HTTP {r.status_code}')
+            log(f'[PremiumTV] manifest HTTP {r.status_code}')
             return None
-        log(f'[PremiumTV] manifeste refuse (403), jeton renouvele' if attempt == 0
-            else '[PremiumTV] manifeste refuse (403) meme avec un jeton neuf')
+        log(f'[PremiumTV] manifest refused (403), token renewed' if attempt == 0
+            else '[PremiumTV] manifest refused (403) even with a fresh token')
     return None
 
 
@@ -6660,10 +6660,10 @@ def _placeholder_stream(manifest_url, referer=None, timeout=6):
         m = sess.get(_ptv_manifest_url(manifest_url, referer or ''),
                      headers=hdrs, timeout=timeout)
         if m.status_code != 200:
-            log(f'[Placeholder] manifest HTTP {m.status_code} pour {manifest_url[:80]}')
+            log(f'[Placeholder] manifest HTTP {m.status_code} for {manifest_url[:80]}')
             return 'error'
         if not m.text.lstrip().startswith('#EXTM3U'):
-            log(f'[Placeholder] manifest illisible (pas une playlist) {manifest_url[:70]}')
+            log(f'[Placeholder] manifest unreadable (not a playlist) {manifest_url[:70]}')
             return 'error'
         pl_url, pl_text = manifest_url, m.text
         if '#EXT-X-STREAM-INF' in m.text:
@@ -6677,7 +6677,7 @@ def _placeholder_stream(manifest_url, referer=None, timeout=6):
             var_url = variants[0] if variants[0].startswith('http') else urljoin(manifest_url, variants[0])
             vm = sess.get(var_url, headers=hdrs, timeout=timeout)
             if vm.status_code != 200:
-                log(f'[Placeholder] variante HTTP {vm.status_code} pour {var_url[:70]}')
+                log(f'[Placeholder] variant HTTP {vm.status_code} for {var_url[:70]}')
                 return 'error'
             if not vm.text.lstrip().startswith('#EXTM3U'):
                 return 'error'
@@ -6693,7 +6693,7 @@ def _placeholder_stream(manifest_url, referer=None, timeout=6):
         # would classify every premiumtv channel as a placeholder.
         r = sess.get(seg, headers=hdrs, timeout=15)
         if r.status_code not in (200, 206):
-            log(f'[Placeholder] segment HTTP {r.status_code} pour {seg[:70]}')
+            log(f'[Placeholder] segment HTTP {r.status_code} for {seg[:70]}')
             return 'error'
         if _ts_payload_offset(r.content) >= 0:
             return 'ok'
@@ -7397,8 +7397,8 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
             # CDN, a 404, a timeout. Reporting success there made DLTV announce
             # "Stream started" and Kodi die one second later on "Error creating
             # demuxer", with the remaining backends of the cascade never tried.
-            log(f'[PlayStream] {channel_key}: manifeste premiumtv inaccessible — '
-                f'backend abandonne, essai du backend suivant')
+            log(f'[PlayStream] {channel_key}: premiumtv manifest inaccessible — '
+                f'backend abandoned, trying the next one')
             log('[PlayStream] backend failed: ' + f'premiumtv manifest unreachable (ch.{channel_id})')
             return None
         _set_channel_state(channel_key, 'direct', 'direct', direct_url, player_referer=direct_ref)
@@ -7443,8 +7443,8 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
                 log('[PlayStream] backend failed: ' + f'Channel offline (ch.{channel_id})')
                 return None
             if _ph == 'error':
-                log(f'[PlayStream] {channel_key}: manifeste premiumtv inaccessible — '
-                    f'backend abandonne, essai du backend suivant')
+                log(f'[PlayStream] {channel_key}: premiumtv manifest inaccessible — '
+                    f'backend abandoned, trying the next one')
                 log('[PlayStream] backend failed: ' + f'premiumtv manifest unreachable (ch.{channel_id})')
                 return None
             _set_channel_state(channel_key, 'direct', 'direct', direct_url, player_referer=direct_ref)
@@ -7600,8 +7600,8 @@ def PlayStream(link):
                 # per session, then ECONNREFUSED for everything including channels
                 # that were just playing). Retrying now would only lock out what
                 # still works; the quarantine expires on its own.
-                log(f'[PlayStream] skipping {_label} — portail en quarantaine '
-                    f'(quota de connexions epuise)')
+                log(f'[PlayStream] skipping {_label} — portal quarantined '
+                    f'(connection quota spent)')
                 continue
             log(f'[PlayStream] trying backend: {_label}')
             _res = _resolve_playback(channel_id, channel_key, _cdn)
@@ -7612,7 +7612,7 @@ def PlayStream(link):
                 # actually produced the URL, not what the cascade was attempting.
                 _served = _label
                 if player_origin == 'premiumtv':
-                    _served = 'Direct HLS (premiumtv, fallback depuis wideiptv)'
+                    _served = 'Direct HLS (premiumtv, fallback from wideiptv)'
                 log(f'[PlayStream] backend OK: {_served}')
                 break
         if not m3u8_url:
@@ -7621,7 +7621,7 @@ def PlayStream(link):
             # so a backend that just failed often works on a second attempt; this also
             # covers codec cases the cascade ordering cannot know about (wideiptv's H.264
             # on a Kodi that refuses HEVC).
-            _mi = xbmcgui.Dialog().select(f'Aucun backend ne marche — ch.{channel_id}\nForcer lequel?',
+            _mi = xbmcgui.Dialog().select(f'No backend works — ch.{channel_id}\nWhich one to force?',
                                           [label for label, _ in _MANUAL_CDNS])
             if _mi >= 0:
                 _, _forced = _MANUAL_CDNS[_mi]
@@ -8101,9 +8101,9 @@ else:
                         del cache[u]
                 _save_page_cache(cache)
                 xbmcgui.Dialog().notification(
-                    'DLTV', f'Planning actualise ({removed} page(s) rechargees)', ICON, 2500)
+                    'DLTV', f'Schedule updated ({removed} page(s) reloaded)', ICON, 2500)
             except Exception as e:
-                xbmcgui.Dialog().notification('DLTV', f'Erreur: {e}', ICON, 3000)
+                xbmcgui.Dialog().notification('DLTV', f'Error: {e}', ICON, 3000)
             # The directory is closed as a success: this entry is an action, not a
             # listing, and endOfDirectory(handle, False) made Kodi log "Error getting
             # plugin://...?serv_type=refresh_schedule" and "GetDirectory failed" on
