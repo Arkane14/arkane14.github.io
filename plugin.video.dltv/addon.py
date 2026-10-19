@@ -1,4 +1,4 @@
-# version: 1.2.60 (doit correspond à addon.xml)
+# version: 1.2.61 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -4044,6 +4044,25 @@ _active_base_failed_at = 0
 _ACTIVE_BASE_FAIL_TTL = 30   # seconds before re-probing a portal that just refused
 
 
+_BASE_OK_FILE = os.path.join(_KODI_TEMP, 'dltv_base_ok')
+_BASE_OK_TTL = 600              # the base URL is good for ten minutes
+
+
+def _base_recently_ok():
+    try:
+        return (time.time() - os.path.getmtime(_BASE_OK_FILE)) < _BASE_OK_TTL
+    except OSError:
+        return False
+
+
+def _base_mark_ok():
+    try:
+        with open(_BASE_OK_FILE, 'w') as f:
+            f.write(str(time.time()))
+    except OSError:
+        pass
+
+
 def get_active_base():
     global _active_base_cache, _active_base_failed_at
     if _active_base_cache:
@@ -4068,6 +4087,13 @@ def get_active_base():
         return base
     base = _load_portal_base()
     if base:
+        # Validate the base only now and then. Kodi starts a fresh interpreter for
+        # every menu entry, so validating on every process start spent one of the
+        # site's nineteen connections per channel, just to learn what the previous
+        # channel had already established.
+        if _base_recently_ok():
+            _active_base_cache = base
+            return base
         # Validate once per process — if unreachable, fall back to seed
         try:
             r = requests.get(base, headers={'User-Agent': UA}, timeout=5,
@@ -4075,6 +4101,7 @@ def get_active_base():
             if r.status_code >= 400:
                 raise Exception(f'HTTP {r.status_code}')
             _portal_note_contact()
+            _base_mark_ok()
         except Exception as e:
             log(f'[get_active_base] {base} invalide ({e}), reset vers seed')
             _portal_note_refusal('get_active_base')
@@ -6125,6 +6152,45 @@ def get_stream_page_url(channel_id):
         return None, None
 
 
+_RESOLVED_FILE = os.path.join(_KODI_TEMP, 'dltv_resolved.json')
+_RESOLVED_TTL = 1800             # 30 min: the premiumtv URL of a channel is stable
+_resolved_lock = threading.Lock()
+
+
+def _resolved_get(channel_id):
+    """Premiumtv URL already resolved for this channel, if it is still fresh.
+
+    The portal counts connections, and the budget is about nineteen for a whole
+    session. Re-opening the same channel spent one of them every single time, for
+    a URL that does not change: the playlist token is added at request time, so
+    the stored one never goes stale."""
+    try:
+        with open(_RESOLVED_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+        ent = data.get(str(channel_id))
+        if isinstance(ent, dict) and (time.time() - float(ent.get('ts', 0))) < _RESOLVED_TTL:
+            return ent.get('url'), ent.get('player')
+    except Exception:
+        pass
+    return None, None
+
+
+def _resolved_put(channel_id, url, player):
+    try:
+        with _resolved_lock:
+            try:
+                with open(_RESOLVED_FILE, encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data[str(channel_id)] = {'url': url, 'player': player, 'ts': time.time()}
+            _write_file(_RESOLVED_FILE, json.dumps(data))
+    except Exception:
+        pass
+
+
 def get_direct_hls_url(channel_id):
     """Fetch stream-{id}.php → premiumtv iframe → decode base64 HLS source URL.
     Some channels are served as a plain (unencrypted) HLS stream from the premiumtv
@@ -6132,6 +6198,10 @@ def get_direct_hls_url(channel_id):
     Returns (hls_url, player_page_url) or (None, None). The player page is returned
     because the CDN validates the Origin against it, and the manifest needs the
     short-lived playlist token the player fetches from {EDGE}/api/playlist-token."""
+    _cached_url, _cached_player = _resolved_get(channel_id)
+    if _cached_url:
+        log(f'[DirectHls] resolution en cache pour {channel_id} — aucune requete portail')
+        return _cached_url, _cached_player
     try:
         watch_url = abs_url(f'watch.php?id={channel_id}')
         stream_page = abs_url(f'stream/stream-{channel_id}.php')
@@ -6205,6 +6275,7 @@ def get_direct_hls_url(channel_id):
         log(f'[DirectHls] OK ({channel_id}): {hls_url[:100]}')
         # The second element is the Origin the CDN checks: the premiumtv player
         # page's own origin, not the portal's.
+        _resolved_put(channel_id, hls_url, player_url)
         return hls_url, player_url
     except Exception as e:
         _portal_note_refusal('directhls')
