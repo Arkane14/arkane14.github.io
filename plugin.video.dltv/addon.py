@@ -1,4 +1,4 @@
-# version: 1.2.57 (doit correspond à addon.xml)
+# version: 1.2.58 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -1732,7 +1732,10 @@ def _ptv_fetch(url, origin, cdn_host='', timeout=8):
     with _ptv_origin_lock:
         known = _ptv_good_origin.get(cdn_host) if cdn_host else None
     candidates = [known] if known else []
-    candidates += [o for o in [page_root] + list(_PTV_ORIGIN_FALLBACKS) if o not in candidates]
+    extra = list(_PTV_ORIGIN_FALLBACKS)
+    if _ptv_player_origin and _ptv_player_origin not in extra:
+        extra.insert(0, _ptv_player_origin)
+    candidates += [o for o in [page_root] + extra if o not in candidates]
     last = None
     for i, o in enumerate(candidates):
         try:
@@ -2974,7 +2977,11 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 return
 
             _cdn_host = urlparse(raw_url).hostname or ''
-            _code, _body, _final, _rh = _ptv_fetch(raw_url, origin, _cdn_host)
+            # The manifest needs a fresh playlist token every time it is served: the
+            # one baked into the URL expires after 120 s, and the CDN answers 403 to a
+            # manifest without a valid one.
+            _manifest = _ptv_manifest_url(raw_url, origin) if '.m3u8' in raw_url else raw_url
+            _code, _body, _final, _rh = _ptv_fetch(_manifest, origin, _cdn_host)
             hdrs = {'Referer': origin if '?' in origin else origin.rstrip('/') + '/'}
             referer = hdrs['Referer']
             _R = type('R', (), {'status_code': _code, 'content': _body,
@@ -6061,7 +6068,9 @@ def get_direct_hls_url(channel_id):
     """Fetch stream-{id}.php → premiumtv iframe → decode base64 HLS source URL.
     Some channels are served as a plain (unencrypted) HLS stream from the premiumtv
     player page (e.g. xameleon.phantemlis.top) instead of the CHEVY-encrypted CDN.
-    Returns (hls_url, watch_url) or (None, None)."""
+    Returns (hls_url, player_page_url) or (None, None). The player page is returned
+    because the CDN validates the Origin against it, and the manifest needs the
+    short-lived playlist token the player fetches from {EDGE}/api/playlist-token."""
     try:
         watch_url = abs_url(f'watch.php?id={channel_id}')
         stream_page = abs_url(f'stream/stream-{channel_id}.php')
@@ -6107,10 +6116,19 @@ def get_direct_hls_url(channel_id):
         if not hls_url.startswith('http'):
             log(f'[DirectHls] source not http: {hls_url[:60]}')
             return None, None
+        # The premiumtv CDN validates the Origin against the player page, not against
+        # the portal: it answers 403 to dlive.sx and to dlstreams.st, and 200 to the
+        # player's own origin (dembed.st). Returning the player URL here makes the
+        # proxy send the right Origin, and lets the manifest carry its token.
+        global _ptv_player_origin
+        _ptv_player_origin = _origin_root(player_url)
+        hls_url = _ptv_manifest_url(hls_url, player_url)
         # If the decoded URL is a master playlist, follow the first variant so the
         # TS stream proxy receives a media playlist (its segment parser expects one).
         try:
-            r3 = sess.get(hls_url, headers={'User-Agent': UA, 'Referer': watch_url + '/'}, timeout=8)
+            r3 = sess.get(_ptv_manifest_url(hls_url, player_url),
+                          headers={'User-Agent': UA, 'Referer': player_url,
+                                   'Origin': _origin_root(player_url)}, timeout=8)
             if r3.status_code == 200 and '#EXT-X-STREAM-INF' in r3.text:
                 for _sl in r3.text.splitlines():
                     _sl = _sl.strip()
@@ -6122,7 +6140,9 @@ def get_direct_hls_url(channel_id):
             log(f'[DirectHls] variant resolution skipped: {e}')
         _portal_note_contact()
         log(f'[DirectHls] OK ({channel_id}): {hls_url[:100]}')
-        return hls_url, watch_url
+        # The second element is the Origin the CDN checks: the premiumtv player
+        # page's own origin, not the portal's.
+        return hls_url, player_url
     except Exception as e:
         _portal_note_refusal('directhls')
         log(f'[DirectHls] error for id={channel_id}: {e}')
@@ -6321,8 +6341,12 @@ def _guess_premiumtv_url(channel_id, timeout=6):
     connections, which is exactly what matters once the site's TCP budget is spent.
     """
     url = _PTV_CDN_PATTERN.format(id=channel_id)
+    # The CDN checks the Origin against the player page; when the portal is down we
+    # cannot ask it, so reuse the player origin learned during the last successful
+    # resolution. Without it the manifest is refused with 403.
+    origin = _ptv_player_origin or 'https://dembed.st'
     try:
-        code, body, _final, _hdrs = _ptv_fetch(url, 'https://dlive.sx/watch.php',
+        code, body, _final, _hdrs = _ptv_fetch(url, origin,
                                                urlparse(url).hostname or '', timeout=timeout)
     except Exception as e:
         log(f'[PremiumTVGuess] premium{channel_id} inaccessible ({type(e).__name__})')
@@ -6334,7 +6358,7 @@ def _guess_premiumtv_url(channel_id, timeout=6):
         return None, None
     _ptv_guess_ok[channel_id] = True
     log(f'[PremiumTVGuess] premium{channel_id} resolu sans le portail : {url}')
-    return url, 'https://dlive.sx/watch.php'
+    return url, origin
 
 
 def _direct_hls_with_guess(channel_id):
@@ -6343,6 +6367,73 @@ def _direct_hls_with_guess(channel_id):
     if url:
         return url, ref
     return _guess_premiumtv_url(channel_id)
+
+
+_ptv_token_lock = threading.Lock()
+_ptv_token_cache = {}       # (host, slug) -> (token, expires_at)
+_ptv_player_origin = ''     # origin of the premiumtv player page, learned at runtime
+
+
+def _ptv_playlist_token(manifest_url, player_page_url, timeout=8):
+    """Short-lived token the premiumtv CDN requires on a manifest.
+
+    The player page fetches it from {EDGE}/api/playlist-token?slug={CHANNEL} and
+    appends it as "?t=<token>"; the CDN answers 403 for the manifest without it. Only
+    the manifest is affected — the segments carry their own signature and need
+    nothing. The token lives 120 s, so it is fetched on demand and cached.
+
+    The request also has to carry the player page's own Origin: the CDN answers 403
+    to the portal origin, which is why the whole premiumtv backend died once the
+    site moved its player to dembed.st."""
+    host = urlparse(manifest_url).hostname or ''
+    parts = [p for p in urlparse(manifest_url).path.split('/') if p]
+    slug = parts[0] if parts else ''
+    if not host or not slug:
+        return ''
+    key = (host, slug)
+    now = time.time()
+    with _ptv_token_lock:
+        ent = _ptv_token_cache.get(key)
+        if ent and ent[1] > now:
+            return ent[0]
+    origin = _origin_root(player_page_url or '')
+    headers = {'User-Agent': UA, 'Origin': origin} if origin else {'User-Agent': UA}
+    if player_page_url:
+        headers['Referer'] = player_page_url
+    try:
+        r = requests.get(f'https://{host}/api/playlist-token?slug={quote_plus(slug)}',
+                         headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            log(f'[PremiumTV] playlist-token HTTP {r.status_code} pour {slug}')
+            return ''
+        data = r.json()
+        token = data.get('token') or ''
+        ttl = max(20.0, float(data.get('ttl') or 120))
+    except Exception as e:
+        log(f'[PremiumTV] playlist-token indisponible ({type(e).__name__})')
+        return ''
+    if not token:
+        return ''
+    with _ptv_token_lock:
+        _ptv_token_cache[key] = (token, now + ttl - 10)
+    return token
+
+
+def _origin_root(url):
+    """scheme://host of a URL, or '' when it cannot be parsed."""
+    if not url:
+        return ''
+    p = urlparse(url)
+    return f'{p.scheme}://{p.netloc}' if p.scheme and p.netloc else ''
+
+
+def _ptv_manifest_url(manifest_url, player_page_url):
+    """The manifest URL with the playlist token the CDN demands."""
+    token = _ptv_playlist_token(manifest_url, player_page_url)
+    if not token:
+        return manifest_url
+    base = manifest_url.split('?', 1)[0]
+    return f'{base}?t={quote_plus(token)}'
 
 
 def _placeholder_stream(manifest_url, referer=None, timeout=6):
@@ -6365,7 +6456,8 @@ def _placeholder_stream(manifest_url, referer=None, timeout=6):
         hdrs = _ptv_headers(referer or '', urlparse(manifest_url).hostname or '')
         if not referer:
             hdrs.pop('Referer', None)
-        m = sess.get(manifest_url, headers=hdrs, timeout=timeout)
+        m = sess.get(_ptv_manifest_url(manifest_url, referer or ''),
+                     headers=hdrs, timeout=timeout)
         if m.status_code != 200:
             log(f'[Placeholder] manifest HTTP {m.status_code} pour {manifest_url[:80]}')
             return 'error'
