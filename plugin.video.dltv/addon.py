@@ -1,4 +1,4 @@
-# version: 1.2.59 (doit correspond à addon.xml)
+# version: 1.2.60 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -75,6 +75,28 @@ def _shutting_down():
     except Exception:
         return False
 _FAV_FILE = os.path.join(_KODI_TEMP, 'dltv_favorites.json')
+
+
+def _heal_settings_file():
+    """Delete a settings.xml Kodi cannot parse, so it writes a valid one.
+
+    Kodi logs "failed to load addon settings from .../settings.xml" every time the
+    file is unreadable, and the add-on then appears to have lost its settings and its
+    favourites. A zero-length settings.xml is the usual shape: one interrupted write
+    is enough, and Kodi does not recover from it by itself — it keeps reporting the
+    same failure on every start. Removing the file makes Kodi recreate it, and the
+    favourites come back from dltv_favorites.json."""
+    try:
+        profile = addon.getAddonInfo('profile')
+        path = os.path.join(xbmcvfs.translatePath(profile), 'settings.xml')
+        if not os.path.exists(path):
+            return
+        if os.path.getsize(path) > 0:
+            return
+        os.remove(path)
+        log('[settings] settings.xml vide supprime — Kodi va le recreer')
+    except Exception as e:
+        log(f'[settings] verification impossible ({type(e).__name__})')
 _EXTRA_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_extra_channels.json')
 
 
@@ -2868,12 +2890,24 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 return
 
             _cdn_host = urlparse(raw_url).hostname or ''
-            # 15 s, not 5: a premiumtv segment is ~3.4 MB and the measured throughput
-            # on that host is 0.74-1.17 Mo/s, so a healthy fetch already takes up to
-            # 4.6 s. A 5 s budget turned ordinary slowness into "Read timed out" and a
-            # dead stream, while the bandwidth could not have delivered it faster.
-            _code, _body, _final, _rh = _ptv_fetch(raw_url, origin, _cdn_host,
-                                                  timeout=_PTV_SEGMENT_TIMEOUT)
+            if '.m3u8' in raw_url.split('?')[0]:
+                # A manifest reached through /raw/ — the variant playlist of a master
+                # goes that way — needs the same playlist token as the one served on
+                # /ptv/. Without it the CDN answers 403, and the generic _ptv_fetch
+                # then burned three origins per attempt, which is how one refusal
+                # turned into a hundred requests.
+                _body = _ptv_fetch_manifest(raw_url, origin)
+                if _body is None:
+                    _body = _ptv_stale_manifest(raw_url)
+                _code = 200 if _body else 502
+                _final, _rh = raw_url, {}
+            else:
+                # 15 s, not 5: a premiumtv segment is ~3.4 MB and the measured
+                # throughput on that host is 0.74-1.17 Mo/s, so a healthy fetch
+                # already takes up to 4.6 s. A 5 s budget turned ordinary slowness
+                # into "Read timed out" and a dead stream.
+                _code, _body, _final, _rh = _ptv_fetch(raw_url, origin, _cdn_host,
+                                                      timeout=_PTV_SEGMENT_TIMEOUT)
             hdrs = {'Referer': origin if '?' in origin else origin.rstrip('/') + '/'}
             referer = hdrs['Referer']
 
@@ -3661,6 +3695,12 @@ def log(msg):
             xbmc.log(f'[ DLTV ] Logging Failure: {e}', 2)
         except:
             pass
+
+
+# Kodi reads the add-on settings before any of our code runs, so a settings.xml it
+# cannot parse is only noticed on the next start. Clearing it here means the next
+# start recreates a valid one, and the favourites come back from dltv_favorites.json.
+_heal_settings_file()
 
 # Stamp every session with the build that produced it. Logs get rotated and
 # concatenated across versions, so without this a capture cannot be attributed.
@@ -6409,8 +6449,15 @@ def _ptv_playlist_token(manifest_url, player_page_url, timeout=8, force=False):
     to the portal origin, which is why the whole premiumtv backend died once the
     site moved its player to dembed.st."""
     host = urlparse(manifest_url).hostname or ''
-    parts = [p for p in urlparse(manifest_url).path.split('/') if p]
-    slug = parts[0] if parts else ''
+    path = urlparse(manifest_url).path
+    # The token is per channel: the premiumtv slug. It appears in the manifest path
+    # and in the variant playlist of a master, but not always as the first element.
+    m = re.search(r'premium\d+', path)
+    if m:
+        slug = m.group(0)
+    else:
+        parts = [p for p in path.split('/') if p]
+        slug = parts[0] if parts else ''
     if not host or not slug:
         return ''
     key = (host, slug)
