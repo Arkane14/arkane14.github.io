@@ -1,4 +1,4 @@
-# version: 1.2.61 (doit correspond à addon.xml)
+# version: 1.2.62 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -7751,12 +7751,12 @@ def Search_Channels():
 def Search_Channel_By_Number():
     keyboard = xbmcgui.Dialog().input("Channel number", type=xbmcgui.INPUT_NUMERIC)
     if not keyboard or not keyboard.strip():
-        xbmcplugin.endOfDirectory(addon_handle, False)
+        xbmcplugin.endOfDirectory(addon_handle)
         return
     channel_id = keyboard.strip().lstrip('0') or '0'
     if not channel_id.isdigit():
         xbmcgui.Dialog().notification('DLTV', 'Invalid number', ICON, 3000)
-        xbmcplugin.endOfDirectory(addon_handle, False)
+        xbmcplugin.endOfDirectory(addon_handle)
         return
 
     # Look up channel name from the channel list
@@ -8100,23 +8100,31 @@ else:
                     if 'index.php' in u or '24-7' in u:
                         del cache[u]
                 _save_page_cache(cache)
-                xbmcgui.Dialog().notification('DLTV', f'Schedule cache cleared ({removed} page(s))', ICON, 2500)
+                xbmcgui.Dialog().notification(
+                    'DLTV', f'Planning actualise ({removed} page(s) rechargees)', ICON, 2500)
             except Exception as e:
-                xbmcgui.Dialog().notification('DLTV', f'Error: {e}', ICON, 3000)
-            xbmcplugin.endOfDirectory(addon_handle, False)
+                xbmcgui.Dialog().notification('DLTV', f'Erreur: {e}', ICON, 3000)
+            # The directory is closed as a success: this entry is an action, not a
+            # listing, and endOfDirectory(handle, False) made Kodi log "Error getting
+            # plugin://...?serv_type=refresh_schedule" and "GetDirectory failed" on
+            # every use, even though the cache had been cleared and the menu was
+            # about to be rebuilt.
+            xbmcplugin.endOfDirectory(addon_handle)
+            # The rebuild has to happen after the directory is closed, otherwise the
+            # refresh runs against a listing that is still open.
             xbmc.executebuiltin('Container.Refresh')
         elif servType == 'diagnostics':
             run_diagnostics()
-            xbmcplugin.endOfDirectory(addon_handle, False)
+            xbmcplugin.endOfDirectory(addon_handle)
         elif servType == 'export_m3u':
             pvr_setup()
-            xbmcplugin.endOfDirectory(addon_handle, False)
+            xbmcplugin.endOfDirectory(addon_handle)
         elif servType == 'chat':
             try:
                 xbmc.executebuiltin('StartAndroidActivity("", "android.intent.action.VIEW", "", "https://daddylivehd.chatango.com/")')
             except Exception:
                 xbmcgui.Dialog().ok('DaddyLive Chat', 'Open: https://daddylivehd.chatango.com/')
-            xbmcplugin.endOfDirectory(addon_handle, False)
+            xbmcplugin.endOfDirectory(addon_handle)
 
     elif mode == 'showChannels':
         transType = params.get('trType')
@@ -8152,7 +8160,7 @@ else:
                 save_favorites(favs)
                 xbmcgui.Dialog().notification('DLTV', f'Added: {real_name}', ICON, 3000)
                 xbmc.executebuiltin('Container.Refresh')
-        xbmcplugin.endOfDirectory(addon_handle, False)
+        xbmcplugin.endOfDirectory(addon_handle)
 
     elif mode == 'toggle_fav':
         toggle_favorite(params.get('cid', ''), params.get('name', ''))
@@ -8162,7 +8170,7 @@ else:
         if favs:
             xbmcgui.Dialog().notification('DLTV', f'Checking {len(favs)} channels…', ICON, 2000)
             _probe_favorites_background(favs, force=True)
-        xbmcplugin.endOfDirectory(addon_handle, False)
+        xbmcplugin.endOfDirectory(addon_handle)
 
     elif mode == 'lang_channels':
         list_lang_channels(params.get('lang', 'eng'))
