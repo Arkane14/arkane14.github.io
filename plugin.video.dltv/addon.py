@@ -1,4 +1,4 @@
-# version: 1.2.58 (doit correspond à addon.xml)
+# version: 1.2.59 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -2977,11 +2977,21 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 return
 
             _cdn_host = urlparse(raw_url).hostname or ''
-            # The manifest needs a fresh playlist token every time it is served: the
-            # one baked into the URL expires after 120 s, and the CDN answers 403 to a
-            # manifest without a valid one.
-            _manifest = _ptv_manifest_url(raw_url, origin) if '.m3u8' in raw_url else raw_url
-            _code, _body, _final, _rh = _ptv_fetch(_manifest, origin, _cdn_host)
+            if '.m3u8' in raw_url:
+                # The manifest needs a fresh playlist token, and only the player's own
+                # origin is accepted. One attempt, one retry with a renewed token, and
+                # a stale manifest as last resort — instead of three origins per
+                # attempt, which turned one refusal into a hundred requests.
+                _body = _ptv_fetch_manifest(raw_url, origin)
+                if _body is None:
+                    _body = _ptv_stale_manifest(raw_url)
+                    if _body:
+                        log('[PremiumTVProxy] CDN refuse le manifeste — '
+                            'dernier manifeste connu servi')
+                _code = 200 if _body else 502
+                _final, _rh = raw_url, {}
+            else:
+                _code, _body, _final, _rh = _ptv_fetch(raw_url, origin, _cdn_host)
             hdrs = {'Referer': origin if '?' in origin else origin.rstrip('/') + '/'}
             referer = hdrs['Referer']
             _R = type('R', (), {'status_code': _code, 'content': _body,
@@ -5686,9 +5696,17 @@ def _try_player_page(channel_id, player_url, watch_url, sess):
                 log(f'[AnyPlayer] direct m3u8 unreachable: {candidate[:60]}')
 
         # ── Generic: scan iframes for .m3u8 or streamUrl ────────────────────
+        # The same player page is reached from several player paths (stream, cast,
+        # watch...), and it was fetched again for each: the same wikisport iframe
+        # was scanned three times for one channel. The result is cached per channel.
+        _seen_iframes = _ap_iframe_seen.setdefault(str(channel_id), set())
         for iframe_url in _AP_IFRAME_RX.findall(html):
             if any(skip in iframe_url for skip in _AP_SKIP_HOSTS) or '/premiumtv/' in iframe_url:
                 continue
+            if iframe_url in _seen_iframes:
+                log(f'[AnyPlayer] iframe deja scanne, ignore: {iframe_url[:60]}')
+                continue
+            _seen_iframes.add(iframe_url)
             log(f'[AnyPlayer] scanning iframe: {iframe_url[:80]}')
             try:
                 ri = sess.get(iframe_url, headers={'User-Agent': UA, 'Referer': player_url}, timeout=8)
@@ -5990,6 +6008,9 @@ def _portal_unreachable(window=None):
                 time.time() - _active_base_failed_at < w)
 
 
+_ap_iframe_seen = {}      # channel id -> iframe URLs already scanned
+
+
 def get_any_player_stream(channel_id):
     """Try all player pages (stream, cast, watch, plus, casting, player, embed) in order.
     Applies auto-detection on each: superdinamico/ligapk, lovecdn-style (domain-agnostic),
@@ -6122,7 +6143,9 @@ def get_direct_hls_url(channel_id):
         # proxy send the right Origin, and lets the manifest carry its token.
         global _ptv_player_origin
         _ptv_player_origin = _origin_root(player_url)
-        hls_url = _ptv_manifest_url(hls_url, player_url)
+        # The token is deliberately NOT baked into the stored URL: it expires after
+        # 120 s, and a stale one is a 403 that lasts until the URL is rebuilt. The
+        # proxy adds a fresh one every time it serves the manifest.
         # If the decoded URL is a master playlist, follow the first variant so the
         # TS stream proxy receives a media playlist (its segment parser expects one).
         try:
@@ -6374,7 +6397,7 @@ _ptv_token_cache = {}       # (host, slug) -> (token, expires_at)
 _ptv_player_origin = ''     # origin of the premiumtv player page, learned at runtime
 
 
-def _ptv_playlist_token(manifest_url, player_page_url, timeout=8):
+def _ptv_playlist_token(manifest_url, player_page_url, timeout=8, force=False):
     """Short-lived token the premiumtv CDN requires on a manifest.
 
     The player page fetches it from {EDGE}/api/playlist-token?slug={CHANNEL} and
@@ -6392,10 +6415,11 @@ def _ptv_playlist_token(manifest_url, player_page_url, timeout=8):
         return ''
     key = (host, slug)
     now = time.time()
-    with _ptv_token_lock:
-        ent = _ptv_token_cache.get(key)
-        if ent and ent[1] > now:
-            return ent[0]
+    if not force:
+        with _ptv_token_lock:
+            ent = _ptv_token_cache.get(key)
+            if ent and ent[1] > now:
+                return ent[0]
     origin = _origin_root(player_page_url or '')
     headers = {'User-Agent': UA, 'Origin': origin} if origin else {'User-Agent': UA}
     if player_page_url:
@@ -6425,6 +6449,65 @@ def _origin_root(url):
         return ''
     p = urlparse(url)
     return f'{p.scheme}://{p.netloc}' if p.scheme and p.netloc else ''
+
+
+_ptv_manifest_cache = {}     # manifest url -> (body, timestamp), last known good
+_ptv_manifest_lock = threading.Lock()
+
+
+def _ptv_fetch_manifest(manifest_url, player_page_url, timeout=8):
+    """Fetch the premiumtv manifest with a token, and only the player's own origin.
+
+    The generic _ptv_fetch() tries three origins on a 403. For a manifest that is
+    pure waste: the CDN only ever accepts the player's origin, so a 403 means the
+    token is stale, not that the origin is wrong. Measured on one channel: 48 × 403
+    responses, so 144 requests in a few seconds, all of them useless.
+
+    A fresh token is fetched, and one retry is made with a forced refresh before
+    giving up."""
+    for attempt in (0, 1):
+        token = _ptv_playlist_token(manifest_url, player_page_url,
+                                    timeout=timeout, force=attempt > 0)
+        url = manifest_url
+        if token:
+            url = manifest_url.split('?', 1)[0] + '?t=' + quote_plus(token)
+        origin = _origin_root(player_page_url or '')
+        headers = {'User-Agent': UA}
+        if origin:
+            headers['Origin'] = origin
+        if player_page_url:
+            headers['Referer'] = player_page_url
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+        except Exception as e:
+            log(f'[PremiumTV] manifeste inaccessible ({type(e).__name__})')
+            return None
+        if r.status_code == 200 and r.content[:7] == b'#EXTM3U':
+            with _ptv_manifest_lock:
+                _ptv_manifest_cache[manifest_url] = (r.content, time.time())
+            return r.content
+        if r.status_code != 403:
+            log(f'[PremiumTV] manifeste HTTP {r.status_code}')
+            return None
+        log(f'[PremiumTV] manifeste refuse (403), jeton renouvele' if attempt == 0
+            else '[PremiumTV] manifeste refuse (403) meme avec un jeton neuf')
+    return None
+
+
+def _ptv_stale_manifest(manifest_url, max_age=90):
+    """Last manifest that was served, for when the CDN starts refusing.
+
+    The live playlist keeps a rolling window of segments, so a manifest a few
+    seconds old still points at segments that exist. Answering 502 instead kills
+    the stream outright."""
+    with _ptv_manifest_lock:
+        ent = _ptv_manifest_cache.get(manifest_url)
+    if not ent:
+        return None
+    body, ts = ent
+    if time.time() - ts > max_age:
+        return None
+    return body
 
 
 def _ptv_manifest_url(manifest_url, player_page_url):
@@ -6496,9 +6579,14 @@ def _placeholder_stream(manifest_url, referer=None, timeout=6):
             return 'error'
         if _ts_payload_offset(r.content) >= 0:
             return 'ok'
-        if _unwrap_ptv_segment(r.content):
+        _ts = _unwrap_ptv_segment(r.content)
+        if _ts:
             log('[Placeholder] first segment is a premiumtv PNG envelope with real TS '
                 'inside — not a placeholder')
+            # Keep it: this was a 2-4 MB download, and the proxy was about to fetch
+            # the very same segment again to serve it. The cache key is the segment
+            # URL without its query, which is what the proxy looks up.
+            _ptv_cache_store(seg.split('?', 1)[0], _ts)
             return 'ok'
         log(f'[Placeholder] no MPEG-TS in first segment ({len(r.content)}B '
             f'magic={r.content[:4]!r}) — placeholder stream')
