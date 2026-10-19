@@ -1,4 +1,4 @@
-# version: 1.2.56 (doit correspond à addon.xml)
+# version: 1.2.57 (doit correspond à addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -6346,10 +6346,17 @@ def _direct_hls_with_guess(channel_id):
 
 
 def _placeholder_stream(manifest_url, referer=None, timeout=6):
-    """True when a live manifest's segments are placeholder images instead of MPEG-TS
-    (channel offline / CDN geo-gate). Only the first 64 KB of the first segment is
-    fetched (the CDN honours Range), so this stays cheap. Without it Kodi just reports
-    "Error creating demuxer" because ffmpeg is handed PNG bytes."""
+    """Classify a live manifest: 'ok', 'placeholder' or 'error'.
+
+    'placeholder' means the channel is offline (the CDN serves images instead of
+    MPEG-TS). 'error' means the manifest could not be read at all — 403, 404, a
+    timeout, an HTML body.
+
+    The distinction matters: the old version answered False for both "healthy" and
+    "403 Forbidden", so the caller could not tell a working stream from a refused
+    one. The log then read "backend OK" and "Stream started", and Kodi died one
+    second later on "Error creating demuxer" — while the cascade had other backends
+    left to try and never reached them."""
     try:
         sess = _get_session()
         # Same headers as the proxy will use: a pre-flight that sends less can pass
@@ -6359,8 +6366,12 @@ def _placeholder_stream(manifest_url, referer=None, timeout=6):
         if not referer:
             hdrs.pop('Referer', None)
         m = sess.get(manifest_url, headers=hdrs, timeout=timeout)
-        if m.status_code != 200 or not m.text.lstrip().startswith('#EXTM3U'):
-            return False
+        if m.status_code != 200:
+            log(f'[Placeholder] manifest HTTP {m.status_code} pour {manifest_url[:80]}')
+            return 'error'
+        if not m.text.lstrip().startswith('#EXTM3U'):
+            log(f'[Placeholder] manifest illisible (pas une playlist) {manifest_url[:70]}')
+            return 'error'
         pl_url, pl_text = manifest_url, m.text
         if '#EXT-X-STREAM-INF' in m.text:
             # Master playlist: the non-comment line is a variant playlist, not a segment.
@@ -6369,36 +6380,40 @@ def _placeholder_stream(manifest_url, referer=None, timeout=6):
             variants = [l.strip() for l in m.text.splitlines()
                         if l.strip() and not l.strip().startswith('#')]
             if not variants:
-                return False
+                return 'error'
             var_url = variants[0] if variants[0].startswith('http') else urljoin(manifest_url, variants[0])
             vm = sess.get(var_url, headers=hdrs, timeout=timeout)
-            if vm.status_code != 200 or not vm.text.lstrip().startswith('#EXTM3U'):
-                return False
+            if vm.status_code != 200:
+                log(f'[Placeholder] variante HTTP {vm.status_code} pour {var_url[:70]}')
+                return 'error'
+            if not vm.text.lstrip().startswith('#EXTM3U'):
+                return 'error'
             pl_url, pl_text = var_url, vm.text
             log(f'[Placeholder] master playlist -> variant {var_url[:90]}')
         segs = [l.strip() for l in pl_text.splitlines()
                 if l.strip() and not l.strip().startswith('#')]
         if not segs:
-            return False
+            return 'error'
         seg = segs[0] if segs[0].startswith('http') else urljoin(pl_url, segs[0])
         # The payload is never in the first 64 KB: these envelopes are a PNG, so the
         # TS only appears after the whole image has been decoded. Range-probing here
         # would classify every premiumtv channel as a placeholder.
         r = sess.get(seg, headers=hdrs, timeout=15)
         if r.status_code not in (200, 206):
-            return False
+            log(f'[Placeholder] segment HTTP {r.status_code} pour {seg[:70]}')
+            return 'error'
         if _ts_payload_offset(r.content) >= 0:
-            return False
+            return 'ok'
         if _unwrap_ptv_segment(r.content):
             log('[Placeholder] first segment is a premiumtv PNG envelope with real TS '
                 'inside — not a placeholder')
-            return False
+            return 'ok'
         log(f'[Placeholder] no MPEG-TS in first segment ({len(r.content)}B '
             f'magic={r.content[:4]!r}) — placeholder stream')
-        return True
+        return 'placeholder'
     except Exception as e:
-        log(f'[Placeholder] check skipped: {type(e).__name__}: {str(e)[:60]}')
-        return False
+        log(f'[Placeholder] check failed: {type(e).__name__}: {str(e)[:60]}')
+        return 'error'
 
 
 _UPSTREAM_DEAD_LOADED = False
@@ -7074,9 +7089,19 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
             log('[PlayStream] backend failed: ' + f'Direct HLS unavailable (ch.{channel_id})')
             return None
         log(f'[PlayStream] Direct premiumtv HLS for {channel_key}: {direct_url}')
-        if _placeholder_stream(direct_url, referer=direct_ref):
+        _ph = _placeholder_stream(direct_url, referer=direct_ref)
+        if _ph == 'placeholder':
             log(f'[PlayStream] {channel_key}: CDN serves placeholder images — channel offline')
             log('[PlayStream] backend failed: ' + f'Channel offline (ch.{channel_id})')
+            return None
+        if _ph == 'error':
+            # The manifest itself was refused or unreadable — a 403 from the premiumtv
+            # CDN, a 404, a timeout. Reporting success there made DLTV announce
+            # "Stream started" and Kodi die one second later on "Error creating
+            # demuxer", with the remaining backends of the cascade never tried.
+            log(f'[PlayStream] {channel_key}: manifeste premiumtv inaccessible — '
+                f'backend abandonne, essai du backend suivant')
+            log('[PlayStream] backend failed: ' + f'premiumtv manifest unreachable (ch.{channel_id})')
             return None
         _set_channel_state(channel_key, 'direct', 'direct', direct_url, player_referer=direct_ref)
         _ensure_m3u8_proxy()
@@ -7114,9 +7139,15 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
                 log('[PlayStream] backend failed: ' + f'All CDNs unreachable (ch.{channel_key})')
                 return None
             log(f'[PlayStream] Fallback premiumtv HLS for {channel_key}: {direct_url[:100]}')
-            if _placeholder_stream(direct_url, referer=direct_ref):
+            _ph = _placeholder_stream(direct_url, referer=direct_ref)
+            if _ph == 'placeholder':
                 log(f'[PlayStream] {channel_key}: fallback CDN serves placeholder images — channel offline')
                 log('[PlayStream] backend failed: ' + f'Channel offline (ch.{channel_id})')
+                return None
+            if _ph == 'error':
+                log(f'[PlayStream] {channel_key}: manifeste premiumtv inaccessible — '
+                    f'backend abandonne, essai du backend suivant')
+                log('[PlayStream] backend failed: ' + f'premiumtv manifest unreachable (ch.{channel_id})')
                 return None
             _set_channel_state(channel_key, 'direct', 'direct', direct_url, player_referer=direct_ref)
             encoded_origin = quote_plus(direct_ref)
