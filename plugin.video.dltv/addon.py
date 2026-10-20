@@ -1,4 +1,4 @@
-# version: 1.2.63 (must match addon.xml)
+# version: 1.2.64 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -1183,9 +1183,17 @@ def _fetch_auth_credentials(channel_id, max_attempts=3):
 
 
 def _fetch_direct_m3u8_url(channel_id):
-    """New backend format: the auth player page embeds the final signed m3u8 URL as a
-    base64 literal (source:window.atob('...')). Returns (m3u8_url, player_referer) or
-    (None, None). Tries daddy.php (current) and daddyhd.php (legacy) on each known base."""
+    """The player page embeds the final m3u8 URL, either as a base64 literal
+    (source:window.atob('...')) or literally (const SRC = "...").
+
+    The player page lives on its own host, and its URL is built from the channel id,
+    so it can be reached without asking the portal for stream-{id}.php first. That
+    matters: the portal counts TCP connections per IP and allows about nineteen for
+    a session, while the player host has its own budget. Resolving a channel
+    directly cut the portal traffic of a session from 35 requests to a handful.
+
+    Returns (m3u8_url, player_referer) or (None, None). Tries daddy.php (current)
+    and daddyhd.php (legacy) on each known base."""
     stream_referer = abs_url(f'stream/stream-{channel_id}.php')
     bases = [_KSOHLS_BASE] + [b for b in _KSOHLS_FALLBACK_BASES if b != _KSOHLS_BASE]
     seen = []
@@ -1194,20 +1202,29 @@ def _fetch_direct_m3u8_url(channel_id):
             continue
         seen.append(base)
         for path in ('/premiumtv/daddy.php', '/premiumtv/daddyhd.php'):
+            player_url = f'{base}{path}?id={channel_id}'
             try:
-                r = _get_session().get(f'{base}{path}?id={channel_id}', headers={
+                r = _get_session().get(player_url, headers={
                     'User-Agent': UA,
                     'Referer': stream_referer,
-                }, timeout=4)
+                }, timeout=6)
                 if r.status_code != 200 or _is_js_challenge(r.text):
                     continue
+                u = ''
                 mb = re.search(r"atob\('([A-Za-z0-9+/=]+)'\)", r.text)
-                if not mb:
-                    continue
-                u = base64.b64decode(mb.group(1)).decode('utf-8', 'ignore').strip()
+                if mb:
+                    try:
+                        u = base64.b64decode(mb.group(1)).decode('utf-8', 'ignore').strip()
+                    except Exception:
+                        u = ''
+                if not u:
+                    # Current pages expose the CDN URL literally.
+                    ms = re.search(r'const\s+SRC\s*=\s*[\'"](https?://[^\'"]+)[\'"]', r.text)
+                    if ms:
+                        u = ms.group(1)
                 if u.startswith('http'):
                     log(f'[EPlayerAuth] direct m3u8 found on {base}{path} for id={channel_id}')
-                    return u, base + '/'
+                    return u, player_url
             except Exception as e:
                 log(f'[EPlayerAuth] direct fetch error on {base}{path}: {e}')
                 continue
@@ -6202,6 +6219,19 @@ def get_direct_hls_url(channel_id):
     if _cached_url:
         log(f'[DirectHls] resolution cached for {channel_id} — no portal request')
         return _cached_url, _cached_player
+    # The player page is built from the channel id and lives on its own host, so a
+    # channel can be resolved without spending a portal connection. The portal is
+    # the scarce resource — it allows about nineteen connections per IP and a
+    # session of testing used to spend all of them. The player host is a different
+    # host with its own budget, and the portal page stays as a fallback.
+    try:
+        _direct_url, _direct_player = _fetch_direct_m3u8_url(channel_id)
+        if _direct_url and '.m3u8' in _direct_url:
+            log(f'[DirectHls] resolved {channel_id} without the portal: {_direct_url[:80]}')
+            _resolved_put(channel_id, _direct_url, _direct_player)
+            return _direct_url, _direct_player
+    except Exception as e:
+        log(f'[DirectHls] direct player lookup failed for {channel_id}: {e}')
     try:
         watch_url = abs_url(f'watch.php?id={channel_id}')
         stream_page = abs_url(f'stream/stream-{channel_id}.php')
@@ -6604,6 +6634,12 @@ def _ptv_fetch_manifest(manifest_url, player_page_url, timeout=8):
             with _ptv_manifest_lock:
                 _ptv_manifest_cache[manifest_url] = (r.content, time.time())
             return r.content
+        if r.status_code == 404:
+            # The site rotates its channels: a manifest that was there yesterday can
+            # be gone today, and the CDN then answers 404 to a perfectly valid token.
+            # That is a dead channel, not a broken one — say so and move on.
+            log(f'[PremiumTV] channel gone (manifest 404) for {manifest_url[:60]}')
+            return None
         if r.status_code != 403:
             log(f'[PremiumTV] manifest HTTP {r.status_code}')
             return None
