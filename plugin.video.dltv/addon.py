@@ -1,4 +1,4 @@
-# version: 1.2.68 (must match addon.xml)
+# version: 1.2.69 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -238,6 +238,7 @@ _PAGE_CACHE_FILE = os.path.join(_KODI_TEMP, 'dltv_page_cache.json')
 _FAILED_KEY = '__failed_urls'   # failure marks live in the same file, separate key
 _PORTAL_KEY = '__portal_quota'  # TCP-connection budget, same file
 _WIDE_NODES_KEY = '__wide_nodes'  # per-node service verdicts, same file
+_WIDE_NODE_HISTORY_KEY = '__wide_node_history'  # nodes the site has advertised
 _PORTAL_BASE_FILE = os.path.join(_KODI_TEMP, 'dltv_portal_base.txt')
 
 
@@ -7153,6 +7154,16 @@ def _wide_node_file_write(host):
         if not isinstance(data, dict):
             data = {}
         data[_WIDE_NODE_KEY] = host
+        # Keep the nodes seen so far: the site rotates them (ds164 -> ds167 -> ds168
+        # -> ds169 -> go.wideiptv.top over a few days) and a node can answer the
+        # manifest while refusing the segments. The previous ones are then worth a
+        # try before giving the channel up.
+        _hist = data.get(_WIDE_NODE_HISTORY_KEY)
+        if not isinstance(_hist, list):
+            _hist = []
+        if host and host not in _hist:
+            _hist.append(host)
+        data[_WIDE_NODE_HISTORY_KEY] = _hist[-8:]
         _dir = os.path.dirname(_WIDE_SLUG_FILE)
         fd, tmp_path = tempfile.mkstemp(dir=_dir)
         try:
@@ -7290,6 +7301,48 @@ def _wide_host_resolves(host):
         return True
     except Exception:
         return False
+
+
+def _wide_url_usable(url):
+    """True when a wideiptv CDN URL is worth handing to Kodi.
+
+    A node can answer the manifest and still refuse the segments — that is what
+    ds169.bluetier.top was doing — and a URL handed over in that state leaves Kodi
+    with "Error creating demuxer" seconds later. Checking costs one segment fetch
+    and saves the user a black screen."""
+    host = urlparse(url).hostname or ''
+    if not host or ('bluetier' not in host and 'wideiptv' not in host):
+        return True
+    parts = [x for x in urlparse(url).path.split('/') if x]
+    slug = parts[1] if len(parts) >= 2 else ''
+    if not slug:
+        return True
+    if _wide_probe(url, slug):
+        log(f'[PlayStream] wideiptv URL verified on {host}')
+        return True
+    log(f'[PlayStream] wideiptv URL refused by the node ({host}) — not using it')
+    return False
+
+
+def _wide_known_nodes():
+    """CDN hosts the site has advertised, most recent first."""
+    try:
+        with open(_WIDE_SLUG_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    hist = data.get(_WIDE_NODE_HISTORY_KEY) if isinstance(data, dict) else None
+    if not isinstance(hist, list):
+        return []
+    with _wide_node_lock:
+        glob = _wide_node_global
+    out = []
+    if glob and glob[0]:
+        out.append(glob[0])
+    for h in reversed(hist):
+        if h and h not in out:
+            out.append(h)
+    return out
 
 
 def _wide_rebase_node(slug, url):
@@ -7471,6 +7524,10 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
         ap_result = get_any_player_stream(channel_id)
         if ap_result:
             _ap_url_tmp, _ = ap_result
+            if not _wide_url_usable(_ap_url_tmp):
+                ap_result = None
+        if ap_result:
+            _ap_url_tmp, _ = ap_result
             # Cross-channel viewembed: EPlayerProxy URL for a different channel key
             # (e.g. eurosport2fr for premium773). The viewembed channel has auth state
             # (salt/nonce/sig) set up — route via /stream/ so the key is fetched with auth.
@@ -7487,7 +7544,26 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
         elif ap_result:
             real_m3u8_url, player_origin = ap_result
             log(f'[PlayStream] AnyPlayer URL: {real_m3u8_url} (origin={player_origin})')
-            use_player6 = True
+            # When the player hands back a wideiptv CDN URL, it has to be checked
+            # before Kodi gets it. The wideiptv backend had just measured that node
+            # as refusing the segments, and this path handed the very same dead URL
+            # to Kodi, which then failed with "Error creating demuxer" five seconds
+            # later. A URL that was proven broken must not be passed on.
+            _ap_host = urlparse(real_m3u8_url).hostname or ''
+            if _ap_host and ('bluetier' in _ap_host or 'wideiptv' in _ap_host):
+                _ap_slug = ''
+                _parts = [x for x in urlparse(real_m3u8_url).path.split('/') if x]
+                if len(_parts) >= 2:
+                    _ap_slug = _parts[1]
+                if _ap_slug and not _wide_probe(real_m3u8_url, _ap_slug):
+                    log(f'[PlayStream] AnyPlayer wideiptv URL refused by the node '
+                        f'({_ap_host}) — not handing a dead URL to Kodi')
+                    real_m3u8_url = None
+                    ap_result = None
+                else:
+                    log(f'[PlayStream] AnyPlayer wideiptv URL verified on {_ap_host}')
+            if ap_result:
+                use_player6 = True
         else:
             # AnyPlayer failed — try ksohls auth before noauth (noauth often returns placeholder images)
             log('[PlayStream] AnyPlayer failed — trying ksohls auth before noauth fallback')
@@ -7577,7 +7653,23 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
         # round trips to the same host for the same verdict, and connections are
         # the scarce resource here — hence one probe, not two.
         if not _wide_probe(w_url, w_slug):
-            log(f'[PlayStream] wideiptv CDN unreachable — falling back to premiumtv direct HLS')
+            # The node answered the manifest but refused the segment. The site keeps
+            # advertising it, so try the other nodes it has used before: the token
+            # belongs to the slug, not to the host, so swapping the host is enough.
+            _w_host = urlparse(w_url).hostname or ''
+            for _alt in _wide_known_nodes():
+                if _alt == _w_host or not _wide_host_resolves(_alt):
+                    continue
+                _alt_url = w_url.replace(f'//{_w_host}/', f'//{_alt}/', 1)
+                log(f'[PlayStream] wideiptv node {_w_host} refuses the segment — '
+                    f'trying {_alt}')
+                if _wide_probe(_alt_url, w_slug):
+                    w_url = _alt_url
+                    _wide_note_node(w_slug, _alt)
+                    log(f'[PlayStream] wideiptv node {_alt} serves the channel')
+                    break
+            else:
+                log(f'[PlayStream] wideiptv CDN unreachable — falling back to premiumtv direct HLS')
             direct_url, direct_ref = _direct_hls_with_guess(channel_id)
             if not direct_url:
                 log('[PlayStream] backend failed: ' + f'All CDNs unreachable (ch.{channel_key})')
@@ -7660,6 +7752,10 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
             log('[PlayStream] Auth unavailable — trying AnyPlayer fallback before noauth proxy')
             _cross_channel_url = None
             ap_result = get_any_player_stream(channel_id)
+            if ap_result:
+                _ap_url_tmp, _ = ap_result
+                if not _wide_url_usable(_ap_url_tmp):
+                    ap_result = None
             if ap_result:
                 _ap_url_tmp, _ = ap_result
                 # Cross-channel viewembed: route via /stream/ for the viewembed channel
