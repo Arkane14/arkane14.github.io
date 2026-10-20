@@ -1,4 +1,4 @@
-# version: 1.2.67 (must match addon.xml)
+# version: 1.2.68 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -6138,6 +6138,43 @@ def _try_player_page(channel_id, player_url, watch_url, sess):
                         log(f'[AnyPlayer] lovecdn fallback lovetier HTTP {r_lt.status_code} stream={stream_name}')
                     except Exception as e2:
                         log(f'[AnyPlayer] lovecdn fallback lovetier error stream={stream_name}: {e2}')
+
+        # ── Last resort: the site's own stream naming ──────────────────────────
+        # The catalogue the sports players draw from is named after the channel:
+        # 1507 plays F107, 1508 plays F108, 1509 plays F109 — F1 followed by the
+        # last two digits of the channel id. Some channels point at a player whose
+        # payload is obfuscated (tossequip's p2p config, the dervlin embed), and
+        # those channels end up with no stream at all. The naming is the site's own
+        # convention, confirmed on three channels, and the candidate is validated
+        # like any other before being used.
+        try:
+            _tail = str(channel_id)[-2:].zfill(2)
+            if _tail.isdigit():
+                _sib2 = f'https://xstream.st/fslivepro.php?stream=F1{_tail}'
+                log(f'[AnyPlayer] channel {channel_id} -> trying {_sib2[:60]}')
+                try:
+                    # xstream.st only answers to a wikisport referer: with any other
+                    # one it returns a connection error instead of the page.
+                    _sib_ref = f'https://wikisport.info/court/t{_tail[-1]}.php'
+                    _sr2 = sess.get(_sib2, headers={'User-Agent': UA,
+                                                    'Referer': _sib_ref}, timeout=8)
+                except Exception as _se2:
+                    log(f'[AnyPlayer] sibling error: {type(_se2).__name__}')
+                    _sr2 = None
+                if _sr2 is not None and _sr2.status_code == 200:
+                    for _sm2 in _AP_M3U8_RX.finditer(_sr2.text):
+                        _sc2 = _ap_clean_url(_sm2.group(1))
+                        if 'blogspot.com' in _sc2 or 'r-strm.' in _sc2:
+                            continue
+                        try:
+                            _sp2 = sess.get(_sc2, headers={'User-Agent': UA}, timeout=4)
+                        except Exception:
+                            continue
+                        if _sp2.status_code == 200 and '#EXTM3U' in _sp2.text[:200]:
+                            log(f'[AnyPlayer] sibling m3u8 OK: {_sc2[:80]}')
+                            return (_sc2, None)
+        except Exception as _e3:
+            log(f'[AnyPlayer] sibling fallback error: {type(_e3).__name__}')
 
         return None
 
