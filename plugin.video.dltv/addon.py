@@ -1,4 +1,4 @@
-# version: 1.2.69 (must match addon.xml)
+# version: 1.2.70 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -668,6 +668,10 @@ _wide_node_bootstrap_done = False
 # connections they receive, so the retry count — not the timeout — is what decides
 # whether a manifest or segment gets through.
 _WIDE_FETCH_ATTEMPTS = 6
+# A wideiptv segment weighs 1-2.5 MB and the CDN delivers it at 0.1-0.7 Mo/s on a
+# slow link: five seconds was not enough, and the request failed while the payload
+# was still coming. The premiumtv path already uses 15 s for the same reason.
+_WIDE_SEGMENT_TIMEOUT = 20
 _wide_dead_segs = {}            # seg_key -> expiry, for segments the CDN does not have
 _wide_seg_keys = []             # insertion order, for bounded eviction
 _WIDE_SEG_CACHE_MAX = 8         # ~5 MB each at 1080p — keep memory in check
@@ -745,7 +749,8 @@ def _wide_prefetch_seg(seg_url, slug, attempts=6):
         fetch_url = _wide_freshen_url(seg_url, slug)
         for i in range(attempts):
             try:
-                r = requests.get(fetch_url, headers=hdrs, timeout=5)
+                r = requests.get(fetch_url, headers=hdrs,
+                                timeout=_WIDE_SEGMENT_TIMEOUT)
                 if r.status_code == 200 and r.content[:1] == b'\x47':
                     _wide_cache_store(key, r.content)
                     log(f'[WidePrefetch] cached {len(r.content)}B {_wide_log_tail(seg_url, 46)} '
@@ -3162,7 +3167,8 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
             _tries = _WIDE_FETCH_ATTEMPTS
             for _attempt in range(_tries):
                 try:
-                    r = requests.get(fetch_url, headers=hdrs, timeout=5)
+                    r = requests.get(fetch_url, headers=hdrs,
+                                     timeout=_WIDE_SEGMENT_TIMEOUT)
                     break
                 except Exception as e:
                     log(f'[WideIptvProxy] attempt {_attempt + 1}/{_tries} failed '
@@ -6544,18 +6550,28 @@ def _wide_probe(manifest_url, slug, timeout=6):
         log('[WideProbe] playlist carries no segment')
         return False
     seg_url = _wide_freshen_url(urljoin(final, seg.strip()), slug)
+    _last_err = None
     for attempt in range(_WIDE_FETCH_ATTEMPTS):
         try:
-            rs = requests.get(seg_url, headers=hdrs, timeout=timeout, stream=True)
+            rs = requests.get(seg_url, headers=hdrs,
+                              timeout=_WIDE_SEGMENT_TIMEOUT, stream=True)
             body = b''.join(rs.iter_content(65536)[:4])
             rs.close()
             break
         except Exception as e:
+            # The reason was thrown away here, so the log only ever said "first
+            # segment unreachable" and the real cause stayed invisible.
+            _last_err = e
+            log(f'[WideProbe] segment attempt {attempt + 1}/{_WIDE_FETCH_ATTEMPTS} '
+                f'failed ({type(e).__name__}: {str(e)[:50]})')
             if attempt < _WIDE_FETCH_ATTEMPTS - 1:
                 time.sleep(0.4)
     else:
         _wide_node_record(host, False)
-        log('[WideProbe] first segment unreachable — CDN up but not serving')
+        log(f'[WideProbe] first segment unreachable after '
+            f'{_WIDE_FETCH_ATTEMPTS} attempts'
+            + (f' ({type(_last_err).__name__})' if _last_err else '') +
+            ' — CDN up but not serving')
         return False
 
     if not _is_media_segment(body):
@@ -7161,9 +7177,9 @@ def _wide_node_file_write(host):
         _hist = data.get(_WIDE_NODE_HISTORY_KEY)
         if not isinstance(_hist, list):
             _hist = []
-        if host and host not in _hist:
+        if host and (not _hist or _hist[-1] != host):
             _hist.append(host)
-        data[_WIDE_NODE_HISTORY_KEY] = _hist[-8:]
+            data[_WIDE_NODE_HISTORY_KEY] = _hist[-8:]
         _dir = os.path.dirname(_WIDE_SLUG_FILE)
         fd, tmp_path = tempfile.mkstemp(dir=_dir)
         try:
@@ -7274,7 +7290,11 @@ def _wide_note_node(slug, host):
         _wide_node[slug] = (host, time.time())
         if host:
             _wide_node_global = (host, time.time())
-    if host and (prev is None or prev[0] != host):
+    if host:
+        # The host is recorded on every note, not only when it changes: the history
+        # file is what lists the alternative nodes to try when the current one stops
+        # serving, and it never got the current node because the file was only
+        # rewritten on a change.
         _wide_node_file_write(host)
 
 
