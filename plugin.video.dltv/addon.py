@@ -1,4 +1,4 @@
-# version: 1.2.66 (must match addon.xml)
+# version: 1.2.67 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -5832,6 +5832,43 @@ def _try_player_page(channel_id, player_url, watch_url, sess):
                 ri = sess.get(iframe_url, headers={'User-Agent': UA, 'Referer': player_url}, timeout=8)
                 if ri.status_code != 200:
                     continue
+                # A wikisport court page points at one player, but the site's own
+                # convention links the same court number to the xstream catalogue:
+                # court/t7.php -> fslivepro.php?stream=F107, court/t8.php -> F108.
+                # Some courts (t9.php) have moved to a player whose payload is
+                # obfuscated by the p2p engine, which leaves the channel with no
+                # stream at all. The sibling is the site's own mapping for that
+                # court, so it is tried as a fallback and validated like any other
+                # candidate.
+                _cm = re.search(r'/court/t(\d+)\.php', player_url) or \
+                    re.search(r'/court/t(\d+)\.php', iframe_url)
+                if _cm:
+                    # The court number is zero-padded to two digits: court/t7.php maps
+                    # to stream F107, court/t8.php to F108.
+                    _sib = (f'https://xstream.st/fslivepro.php'
+                            f'?stream=F1{_cm.group(1).zfill(2)}')
+                    log(f'[AnyPlayer] court t{_cm.group(1)} -> trying {_sib[:60]}')
+                    try:
+                        # The court page is the referer, not the iframe we came from:
+                        # xstream.st answers 500 when the referer is another site.
+                        _sr = sess.get(_sib, headers={'User-Agent': UA,
+                                                       'Referer': player_url}, timeout=8)
+                    except Exception as _se:
+                        log(f'[AnyPlayer] court sibling error: {type(_se).__name__}')
+                        _sr = None
+                    if _sr is not None and _sr.status_code == 200:
+                        for _smi in _AP_M3U8_RX.finditer(_sr.text):
+                            _scand = _ap_clean_url(_smi.group(1))
+                            if 'blogspot.com' in _scand or 'r-strm.' in _scand:
+                                continue
+                            try:
+                                _srp = sess.get(_scand, headers={'User-Agent': UA}, timeout=4)
+                            except Exception:
+                                continue
+                            if _srp.status_code == 200 and '#EXTM3U' in _srp.text[:200]:
+                                log(f'[AnyPlayer] court sibling m3u8 OK: {_scand[:80]}')
+                                return (_scand, None)
+
                 # ── Nested iframe: many players wrap the real player one level
                 #    deeper than the page we were pointed at. wikisport.{info,wiki,club}
                 #    -> xstream.st/fslivepro.php -> instreams.{live,pro,online} is the
