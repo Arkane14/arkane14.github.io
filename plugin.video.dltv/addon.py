@@ -1,4 +1,4 @@
-# version: 1.2.64 (must match addon.xml)
+# version: 1.2.65 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -3800,7 +3800,15 @@ _portal_state = {}            # {'refusals': int, 'until': ts, 'seen': int}
 _portal_state_lock = threading.Lock()
 _PORTAL_QUOTA = 15            # stay under the measured ceiling of 19
 _PORTAL_REFUSAL_LIMIT = 3     # consecutive refusals before standing down
-_PORTAL_QUARANTINE = 300      # seconds offline once the limit is reached
+# The site counts TCP connections per IP, and that IP is shared: the tablet and the
+# PC sit behind the same one, so the budget is spent by both. Measured on the PC:
+# 9 requests of its own were enough to be refused, and the block then lasted from
+# 20:43:36 to 20:55:05 — over eleven minutes. A five-minute quarantine probed the
+# site two or three times inside that window, each probe costing one connection
+# from a budget that was already spent. Fifteen minutes covers the block, and the
+# wait grows when the refusals keep coming.
+_PORTAL_QUARANTINE = 900
+_PORTAL_QUARANTINE_MAX = 3600
 
 
 def _load_portal_state():
@@ -3811,10 +3819,11 @@ def _load_portal_state():
         if isinstance(st, dict):
             return {'refusals': int(st.get('refusals', 0)),
                     'until': float(st.get('until', 0)),
-                    'seen': int(st.get('seen', 0))}
+                    'seen': int(st.get('seen', 0)),
+                    'quarantines': int(st.get('quarantines', 0))}
     except Exception:
         pass
-    return {'refusals': 0, 'until': 0, 'seen': 0}
+    return {'refusals': 0, 'until': 0, 'seen': 0, 'quarantines': 0}
 
 
 def _save_portal_state(st):
@@ -3867,10 +3876,14 @@ def _portal_offline():
 
 
 def _portal_note_contact():
-    """A portal connection that reached the application layer: the block is not up."""
+    """A portal connection that reached the application layer: the block is not up.
+
+    A success also ends the sequence of quarantines: the backoff only exists for
+    blocks that follow each other without the portal ever answering in between."""
     with _portal_state_lock:
         st = _load_portal_state()
         st['refusals'] = 0
+        st['quarantines'] = 0
         st['seen'] = st.get('seen', 0) + 1
         if st['until'] and st['until'] <= time.time():
             st['until'] = 0
@@ -3878,16 +3891,30 @@ def _portal_note_contact():
 
 
 def _portal_note_refusal(reason=''):
-    """TCP refused. Count it, and stand down for a few minutes once it is clear the
-    quota is spent — retrying the channels that just worked only burns the rest."""
+    """TCP refused. Count it, and stand down for a while once it is clear the
+    quota is spent — retrying the channels that just worked only burns the rest.
+
+    The wait grows with the number of consecutive quarantines: a shared budget that
+    another device keeps draining will not come back on a fixed schedule."""
     with _portal_state_lock:
         st = _load_portal_state()
         st['refusals'] = st.get('refusals', 0) + 1
         if st['refusals'] >= _PORTAL_REFUSAL_LIMIT:
-            st['until'] = time.time() + _PORTAL_QUARANTINE
+            if st.get('until', 0) > time.time():
+                # Already standing down: keep the current window instead of
+                # extending it on every extra refusal.
+                wait = st['until'] - time.time()
+            else:
+                # A new episode: wait longer each time the portal comes back
+                # refusing, since something else is draining the shared budget.
+                rounds = st.get('quarantines', 0) + 1
+                wait = min(_PORTAL_QUARANTINE * (2 ** (rounds - 1)),
+                           _PORTAL_QUARANTINE_MAX)
+                st['quarantines'] = rounds
+                st['until'] = time.time() + wait
             log(f'[PortalQuota] {st["refusals"]} consecutive refusals — portal '
-                f'quarantined for {_PORTAL_QUARANTINE}s (the site counts TCP '
-                f'connections; about {_PORTAL_QUOTA} are allowed per session)')
+                f'quarantined for {int(wait)}s (the site counts TCP connections per '
+                f'IP, shared with the other device; about {_PORTAL_QUOTA} per session)')
         _save_portal_state(st)
 
 
@@ -3898,7 +3925,7 @@ def _portal_refusals():
 
 def _portal_reset():
     with _portal_state_lock:
-        _save_portal_state({'refusals': 0, 'until': 0, 'seen': 0})
+        _save_portal_state({'refusals': 0, 'until': 0, 'seen': 0, 'quarantines': 0})
 
 
 def _load_failed_urls():
