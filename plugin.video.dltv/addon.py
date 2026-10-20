@@ -1,4 +1,4 @@
-# version: 1.2.65 (must match addon.xml)
+# version: 1.2.66 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -1196,6 +1196,15 @@ def _fetch_direct_m3u8_url(channel_id):
     and daddyhd.php (legacy) on each known base."""
     stream_referer = abs_url(f'stream/stream-{channel_id}.php')
     bases = [_KSOHLS_BASE] + [b for b in _KSOHLS_FALLBACK_BASES if b != _KSOHLS_BASE]
+    # The player page is served from the site root as well, so the portal host works
+    # too — but it goes last, because a request to the portal spends a connection
+    # from the budget the site counts per IP, while the player host has its own.
+    try:
+        _portal_base = get_active_base().rstrip('/')
+        if _portal_base and _portal_base not in bases:
+            bases.append(_portal_base)
+    except Exception:
+        pass
     seen = []
     for base in bases:
         if base in seen:
