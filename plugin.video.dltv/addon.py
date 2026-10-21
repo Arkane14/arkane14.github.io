@@ -1,4 +1,4 @@
-# version: 1.2.72 (must match addon.xml)
+# version: 1.2.73 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -27,6 +27,7 @@ import struct
 import random
 import requests
 import threading
+from itertools import islice
 import tempfile
 import concurrent.futures
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -3739,6 +3740,32 @@ _heal_settings_file()
 # concatenated across versions, so without this a capture cannot be attributed.
 log(f'[DLTV] v{addon.getAddonInfo("version")} loaded')
 
+def _atomic_replace(tmp_path, final_path, attempts=6):
+    """Move a temporary file over the final one, retrying a few times.
+
+    Kodi runs each menu entry in its own process, so several of them can write the
+    same cache file at the same moment. On Windows os.replace() then fails with
+    "Access is denied" because the destination is open elsewhere, and the write is
+    simply lost — which is why "Update schedule" appeared to work sometimes and not
+    at other times. A short retry makes the write land.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            os.replace(tmp_path, final_path)
+            return True
+        except OSError as e:
+            last = e
+            if getattr(e, 'errno', None) not in (13, 28) and i >= 1:
+                break
+            time.sleep(0.15 * (i + 1))
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    raise last if last else OSError(f'cannot replace {final_path}')
+
+
 def should_cache_url(url: str) -> bool:
     """
     Determine if this URL is cacheable.
@@ -3786,7 +3813,7 @@ def _save_page_cache(cache):
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(cache, f)
-            os.replace(tmp_path, _PAGE_CACHE_FILE)
+            _atomic_replace(tmp_path, _PAGE_CACHE_FILE)
         except Exception:
             try:
                 os.unlink(tmp_path)
@@ -3856,7 +3883,7 @@ def _save_portal_state(st):
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(data, f)
-        os.replace(tmp_path, _PAGE_CACHE_FILE)
+        _atomic_replace(tmp_path, _PAGE_CACHE_FILE)
     except Exception:
         try:
             os.unlink(tmp_path)
@@ -3987,7 +4014,7 @@ def _save_failed_urls(marks):
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(data, f)
-            os.replace(tmp_path, _PAGE_CACHE_FILE)
+            _atomic_replace(tmp_path, _PAGE_CACHE_FILE)
         except Exception:
             try:
                 os.unlink(tmp_path)
@@ -5387,7 +5414,7 @@ def _mark_channel_failed(channel_key):
         try:
             with os.fdopen(fd, 'w') as f:
                 json.dump(failed, f)
-            os.replace(tmp_path, _FAILED_CHANNELS_FILE)
+            _atomic_replace(tmp_path, _FAILED_CHANNELS_FILE)
         except Exception:
             try:
                 os.unlink(tmp_path)
@@ -5414,7 +5441,7 @@ def _clear_channel_failed(channel_key):
             try:
                 with os.fdopen(fd, 'w') as f:
                     json.dump(failed, f)
-                os.replace(tmp_path, _FAILED_CHANNELS_FILE)
+                _atomic_replace(tmp_path, _FAILED_CHANNELS_FILE)
             except Exception:
                 try:
                     os.unlink(tmp_path)
@@ -6692,7 +6719,12 @@ def _wide_probe(manifest_url, slug, timeout=6):
         try:
             rs = requests.get(seg_url, headers=hdrs,
                               timeout=_WIDE_SEGMENT_TIMEOUT, stream=True)
-            body = b''.join(rs.iter_content(65536)[:4])
+            # iter_content() is a generator, so it cannot be sliced: the slice
+            # raised TypeError on every attempt, the probe never measured
+            # anything, and every wideiptv node was written off as "not
+            # serving" — pushing the channel to the premiumtv fallback, which
+            # needs the portal, which is the scarce resource.
+            body = b''.join(islice(rs.iter_content(65536), 4))
             rs.close()
             break
         except Exception as e:
@@ -7064,7 +7096,7 @@ def _save_upstream_dead():
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(snapshot, f)
-            os.replace(tmp_path, _UPSTREAM_DEAD_FILE)
+            _atomic_replace(tmp_path, _UPSTREAM_DEAD_FILE)
         except Exception:
             try:
                 os.unlink(tmp_path)
@@ -7156,7 +7188,7 @@ def _wide_node_record(host, ok):
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(data, f)
-        os.replace(tmp_path, _PAGE_CACHE_FILE)
+        _atomic_replace(tmp_path, _PAGE_CACHE_FILE)
     except Exception:
         try:
             os.unlink(tmp_path)
@@ -7261,7 +7293,7 @@ def _save_wide_slug_cache():
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(snapshot, f)
-            os.replace(tmp_path, _WIDE_SLUG_FILE)
+            _atomic_replace(tmp_path, _WIDE_SLUG_FILE)
         except Exception:
             try:
                 os.unlink(tmp_path)
@@ -7322,7 +7354,7 @@ def _wide_node_file_write(host):
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(data, f)
-            os.replace(tmp_path, _WIDE_SLUG_FILE)
+            _atomic_replace(tmp_path, _WIDE_SLUG_FILE)
         except Exception:
             try:
                 os.unlink(tmp_path)
@@ -7382,7 +7414,7 @@ def _save_wide_absent():
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(snapshot, f)
-            os.replace(tmp_path, _WIDE_SLUG_ABSENT_FILE)
+            _atomic_replace(tmp_path, _WIDE_SLUG_ABSENT_FILE)
         except Exception:
             try:
                 os.unlink(tmp_path)
