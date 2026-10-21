@@ -1,4 +1,4 @@
-# version: 1.2.75 (must match addon.xml)
+# version: 1.2.76 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -1582,6 +1582,12 @@ def _ptv_decode(key, body):
 
 
 
+def _ptv_segment_in_flight(key):
+    """True when another thread is already fetching this segment."""
+    with _ptv_flight_lock:
+        return key in _ptv_flight
+
+
 def _ptv_await_segment(key, timeout):
     """Return the bytes of a segment another thread is already downloading, or None
     when nobody owns it. The caller then keeps what it downloaded itself instead of
@@ -2977,6 +2983,15 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 _cached = _ptv_cache_get(_ckey)
                 if _cached is not None:
                     _code, _body, _final, _rh = 200, _cached, raw_url, {}
+                elif _ptv_segment_in_flight(_ckey):
+                    # The offline check is already downloading this very segment:
+                    # waiting for it costs no bandwidth and starts the picture sooner.
+                    _waited0 = _ptv_await_segment(_ckey, _PTV_SEGMENT_TIMEOUT)
+                    if _waited0 is not None:
+                        _code, _body, _final, _rh = 200, _waited0, raw_url, {}
+                    else:
+                        _code, _body, _final, _rh = _ptv_fetch(
+                            raw_url, origin, _cdn_host, timeout=_PTV_SEGMENT_TIMEOUT)
                 else:
                     # 15 s, not 5: a premiumtv segment is ~3.4 MB and the measured
                     # throughput on that host is 0.74-1.17 Mo/s, so a healthy fetch
@@ -7026,8 +7041,12 @@ def _ptv_manifest_url(manifest_url, player_page_url):
     return f'{base}?t={quote_plus(token)}'
 
 
-def _placeholder_stream(manifest_url, referer=None, timeout=6):
+def _placeholder_stream(manifest_url, referer=None, timeout=6, check_segment=True):
     """Classify a live manifest: 'ok', 'placeholder' or 'error'.
+
+    check_segment=False stops after the manifest: the caller then only learns whether
+    there is a stream at all, and the segment inspection — the part that decides
+    "offline" and costs a full 3-5 MB download — is left to the background.
 
     'placeholder' means the channel is offline (the CDN serves images instead of
     MPEG-TS). 'error' means the manifest could not be read at all — 403, 404, a
@@ -7076,17 +7095,43 @@ def _placeholder_stream(manifest_url, referer=None, timeout=6):
                 if l.strip() and not l.strip().startswith('#')]
         if not segs:
             return 'error'
+        if not check_segment:
+            return 'ok'
         seg = segs[0] if segs[0].startswith('http') else urljoin(pl_url, segs[0])
         # The payload is never in the first 64 KB: these envelopes are a PNG, so the
         # TS only appears after the whole image has been decoded. Range-probing here
         # would classify every premiumtv channel as a placeholder.
-        r = sess.get(seg, headers=hdrs, timeout=15)
+        #
+        # The segment is announced as being fetched, so the proxy waits for these
+        # bytes instead of downloading the same megabytes in parallel.
+        _seg_key = seg.split('?', 1)[0]
+        with _ptv_flight_lock:
+            _seg_ev = _ptv_flight.get(_seg_key)
+            if _seg_ev is None:
+                _seg_ev = threading.Event()
+                _ptv_flight[_seg_key] = _seg_ev
+        try:
+            r = sess.get(seg, headers=hdrs, timeout=15)
+        except Exception as _se:
+            with _ptv_flight_lock:
+                _ptv_flight.pop(_seg_key, None)
+            _seg_ev.set()
+            raise
         if r.status_code not in (200, 206):
             log(f'[Placeholder] segment HTTP {r.status_code} for {seg[:70]}')
+            with _ptv_flight_lock:
+                _ptv_flight.pop(_seg_key, None)
+            _seg_ev.set()
             return 'error'
         if _ts_payload_offset(r.content) >= 0:
+            with _ptv_flight_lock:
+                _ptv_flight.pop(_seg_key, None)
+            _seg_ev.set()
             return 'ok'
         _ts = _unwrap_ptv_segment(r.content)
+        with _ptv_flight_lock:
+            _ptv_flight.pop(_seg_key, None)
+        _seg_ev.set()
         if _ts:
             log('[Placeholder] first segment is a premiumtv PNG envelope with real TS '
                 'inside — not a placeholder')
@@ -7118,6 +7163,35 @@ def _upstream_dead_bootstrap():
     _load_upstream_dead()
     _load_wide_slug_cache()
     _load_wide_absent()
+
+
+def _background_offline_check(manifest_url, referer, channel_key):
+    """Decide in the background whether the channel is offline.
+
+    The check used to run before the stream was handed to Kodi, and it downloads the
+    first segment in full — 3 to 5 MB — so the picture appeared only after that
+    transfer. The manifest is still read synchronously, because an unreadable
+    manifest means there is no stream to play; but the segment inspection, which is
+    what decides "offline", now runs while the stream is already going.
+
+    The segment is announced as being fetched, so the proxy waits for those bytes
+    instead of downloading the same megabytes in parallel.
+    """
+    def _run():
+        try:
+            state = _placeholder_stream(manifest_url, referer=referer, check_segment=True)
+            if state == 'placeholder':
+                log(f'[PlayStream] {channel_key}: channel is offline — marked')
+                _mark_channel_failed(channel_key)
+                xbmc.executebuiltin('Container.Refresh')
+        except Exception as e:
+            log(f'[PlayStream] offline check failed: {type(e).__name__}')
+
+    try:
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+    except Exception as e:
+        log(f'[PlayStream] offline check not started: {type(e).__name__}')
 
 
 def _load_upstream_dead():
@@ -7727,11 +7801,14 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
             log('[PlayStream] backend failed: ' + f'Direct HLS unavailable (ch.{channel_id})')
             return None
         log(f'[PlayStream] Direct premiumtv HLS for {channel_key}: {direct_url}')
-        _ph = _placeholder_stream(direct_url, referer=direct_ref)
+        _ph = _placeholder_stream(direct_url, referer=direct_ref, check_segment=False)
         if _ph == 'placeholder':
             log(f'[PlayStream] {channel_key}: CDN serves placeholder images — channel offline')
             log('[PlayStream] backend failed: ' + f'Channel offline (ch.{channel_id})')
             return None
+        # The segment inspection is what decides "offline", and it costs a full
+        # segment download: it now runs in the background while the stream plays.
+        _background_offline_check(direct_url, direct_ref, channel_key)
         if _ph == 'error':
             # The manifest itself was refused or unreadable — a 403 from the premiumtv
             # CDN, a 404, a timeout. Reporting success there made DLTV announce
@@ -7792,7 +7869,7 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
                 log('[PlayStream] backend failed: ' + f'All CDNs unreachable (ch.{channel_key})')
                 return None
             log(f'[PlayStream] Fallback premiumtv HLS for {channel_key}: {direct_url[:100]}')
-            _ph = _placeholder_stream(direct_url, referer=direct_ref)
+            _ph = _placeholder_stream(direct_url, referer=direct_ref, check_segment=False)
             if _ph == 'placeholder':
                 log(f'[PlayStream] {channel_key}: fallback CDN serves placeholder images — channel offline')
                 log('[PlayStream] backend failed: ' + f'Channel offline (ch.{channel_id})')
@@ -7802,6 +7879,7 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
                     f'backend abandoned, trying the next one')
                 log('[PlayStream] backend failed: ' + f'premiumtv manifest unreachable (ch.{channel_id})')
                 return None
+            _background_offline_check(direct_url, direct_ref, channel_key)
             _set_channel_state(channel_key, 'direct', 'direct', direct_url, player_referer=direct_ref)
             encoded_origin = quote_plus(direct_ref)
             encoded_url = quote_plus(direct_url)
