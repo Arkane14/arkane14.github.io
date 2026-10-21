@@ -1,4 +1,4 @@
-# version: 1.2.70 (must match addon.xml)
+# version: 1.2.72 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -4004,12 +4004,19 @@ def _stale_cache_for(url, should_cache):
     return e.get('data', '') if isinstance(e, dict) else ''
 
 
-def fetch_via_proxy(url, headers=None, use_cache=True):
+def fetch_via_proxy(url, headers=None, use_cache=True, force=False):
+    """Fetch a page through the portal, with a persistent cache.
+
+    force=True revalidates the page instead of serving the cached copy: the cache
+    lookup and the failure cache are both skipped, and the fresh copy is stored as
+    usual. Deleting the entry beforehand would mean rewriting the whole cache file
+    from a background thread, which can lose the quota state that shares it.
+    """
     global _fetch_failed
     headers = headers or {}
     should_cache = should_cache_url(url)
 
-    if should_cache:
+    if should_cache and not force:
         cached = _load_page_cache()
         entry = cached.get(url)
         if isinstance(entry, dict) and 'data' in entry and 'timestamp' in entry:
@@ -4026,7 +4033,7 @@ def fetch_via_proxy(url, headers=None, use_cache=True):
     if _fail_ts is None:
         _fetch_failed = _load_failed_urls()
         _fail_ts = _fetch_failed.get(url)
-    if _fail_ts and time.time() - _fail_ts < _FETCH_FAIL_TTL:
+    if _fail_ts and time.time() - _fail_ts < _FETCH_FAIL_TTL and not force:
         _stale = ''
         if should_cache:
             _e = _load_page_cache().get(url)
@@ -5091,11 +5098,28 @@ def _fetch_xmltv_fr_epg(cid_name_pairs):
                     xml_gz = f.read()
             except Exception:
                 pass
+            if xml_gz and xml_gz[:2] != b'\x1f\x8b':
+                # A previous download returned an error page instead of the archive.
+                # It was cached for four hours and every refresh reused it, so the EPG
+                # could never recover on its own.
+                log(f'[xmltv] {label}: cached file is not a gzip archive — discarded')
+                xml_gz = None
+                try:
+                    os.remove(cache_file)
+                except OSError:
+                    pass
         if xml_gz is None:
             try:
                 log(f'[xmltv] Downloading {label} EPG...')
                 resp = requests.get(url, timeout=30, headers={'User-Agent': UA})
                 xml_gz = resp.content
+                if xml_gz[:2] != b'\x1f\x8b':
+                    # An error page, a captcha or a redirect: storing it would keep
+                    # the EPG broken for the whole TTL.
+                    log(f'[xmltv] {label}: answer is not a gzip archive '
+                        f'({len(xml_gz)}B, {xml_gz[:16]!r}) — not cached')
+                    xml_gz = None
+                    continue
                 with open(cache_file, 'wb') as f:
                     f.write(xml_gz)
                 log(f'[xmltv] {label}: {len(xml_gz)//1024}KB')
@@ -5183,6 +5207,32 @@ def _fetch_xmltv_fr_epg(cid_name_pairs):
         pass
 
     return {cid: prog_cache[cid] for cid, _ in cid_name_pairs if prog_cache.get(cid)}
+
+
+def _refresh_xmltv(cid_name_pairs):
+    """Re-fetch the EPG and rebuild the programme titles shown next to the channels.
+
+    The channel check tells the user which channels are alive; the programme time
+    next to each one is the other half of that information, and it was only ever
+    refreshed when the favourites list was opened. This brings it in line with the
+    check, so a single action updates both.
+
+    The parsed-programme cache is dropped so the XML is parsed again, and any
+    source file that is not a valid archive is downloaded anew."""
+    if not cid_name_pairs:
+        return False
+    try:
+        try:
+            os.remove(_XMLTV_PROG_CACHE)
+        except OSError:
+            pass
+        log(f'[xmltv] refreshing EPG for {len(cid_name_pairs)} channel(s)')
+        programs = _fetch_xmltv_fr_epg(cid_name_pairs)
+        log(f'[xmltv] EPG refreshed — {len(programs)} channel(s) with a programme')
+        return True
+    except Exception as e:
+        log(f'[xmltv] EPG refresh failed: {e}')
+        return False
 
 
 def _fetch_xmltv_background(cid_name_pairs):
@@ -5377,6 +5427,85 @@ def _clear_channel_failed(channel_key):
     return False
 
 
+_SCHEDULE_REFRESH_MIN = 30    # minutes between schedule refreshes
+_SCHEDULE_MAX_PAGES = 10      # category pages refetched at most
+_SCHEDULE_TS_FILE = os.path.join(_KODI_TEMP, 'dltv_schedule_ts')
+
+
+def _refresh_schedule():
+    """Bring the programme times up to date.
+
+    The schedule lives in the same pages as the categories — index.php and
+    index.php?cat=… — and those are cached for hours, so the times shown next to the
+    channels go stale while the rest of the add-on carries on. The favourites check
+    is the moment the user is already looking at the channel list, so the schedule is
+    refreshed with it.
+
+    Bounded on purpose: the site's connection budget is about thirty for a session,
+    so this runs at most once every _SCHEDULE_REFRESH_MIN minutes and only refetches
+    the pages that are already cached.
+    """
+    now = time.time()
+    try:
+        with open(_SCHEDULE_TS_FILE) as f:
+            last = float(f.read().strip())
+    except Exception:
+        last = 0
+    if now - last < _SCHEDULE_REFRESH_MIN * 60:
+        log(f'[ProbeBackground] schedule still fresh '
+            f'({int((_SCHEDULE_REFRESH_MIN * 60 - (now - last)) / 60)} min left)')
+        return False
+    try:
+        base = get_active_base()
+        # Not named html: that would shadow the html module used right below.
+        page = fetch_via_proxy(abs_url('index.php'),
+                               headers={'User-Agent': UA, 'Referer': base},
+                               force=True)
+        if not page:
+            log('[ProbeBackground] schedule refresh: index.php unavailable')
+            return False
+        # The categories come from the filters block of that page.
+        categs = []
+        m = re.search(r'<div[^>]+class="filters"[^>]*>(.*?)</div>', page,
+                      re.IGNORECASE | re.DOTALL)
+        if m:
+            for _href, _txt in re.findall(
+                    r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', m.group(1),
+                    re.IGNORECASE | re.DOTALL):
+                _name = html.unescape(re.sub(r'\s+', ' ', _txt)).strip()
+                if _name and _name.lower() != 'all' and _name not in categs:
+                    categs.append(_name)
+        # Only the category pages that are actually in the cache get refetched.
+        # The site lists around forty categories, and one request each would be
+        # more than the whole connection budget of a session; the user has normally
+        # opened a handful.
+        try:
+            _cache = _load_page_cache()
+        except Exception:
+            _cache = {}
+        _cat_urls = [u for u in _cache if 'index.php?cat=' in u]
+        if len(_cat_urls) > _SCHEDULE_MAX_PAGES:
+            _cat_urls = _cat_urls[:_SCHEDULE_MAX_PAGES]
+            log(f'[ProbeBackground] schedule limited to {_SCHEDULE_MAX_PAGES} '
+                f'category pages')
+        n = 0
+        for _u in _cat_urls:
+            if fetch_via_proxy(_u, headers={'User-Agent': UA, 'Referer': base},
+                               force=True):
+                n += 1
+        try:
+            with open(_SCHEDULE_TS_FILE, 'w') as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
+        log(f'[ProbeBackground] schedule refreshed ({n} category page(s), '
+            f'{len(categs)} categories)')
+        return True
+    except Exception as e:
+        log(f'[ProbeBackground] schedule refresh failed: {e}')
+        return False
+
+
 def _probe_favorites_background(favs, force=False):
     """Probe each favorite channel's m3u8 in background; update failed cache and refresh list."""
     log(f'[ProbeBackground] Called with {len(favs)} favorites (force={force})')
@@ -5468,6 +5597,14 @@ def _probe_favorites_background(favs, force=False):
                         changed = True
                         log(f'[ProbeBackground] {channel_key}: OK → cleared red')
 
+            # The programme times are refreshed together with the channel check:
+            # they live in the same cached pages and go stale on their own.
+            if _refresh_schedule():
+                changed = True
+            # The EPG shown next to each channel is part of the same information:
+            # it has to follow the check, not only the opening of the list.
+            if _refresh_xmltv([(f.get('id', ''), f.get('name', '')) for f in favs]):
+                changed = True
             if changed:
                 xbmc.executebuiltin('Container.Refresh')
             log(f'[ProbeBackground] Done — {n_ok} OK / {n_ko} KO / {n_skip} skip — {"refreshed" if changed else "no change"}')
