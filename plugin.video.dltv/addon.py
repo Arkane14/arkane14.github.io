@@ -1,4 +1,4 @@
-# version: 1.2.73 (must match addon.xml)
+# version: 1.2.74 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -1580,49 +1580,6 @@ def _ptv_decode(key, body):
     return ts
 
 
-def _ptv_fetch_segment(key, url, origin):
-    """Download + unwrap a premiumtv segment, one download at a time.
-
-    The prefetch and the serving path were both fetching the same opening segment
-    over separate connections at the same moment. On a 0.06-0.7 Mo/s link that halved
-    an already thin bandwidth, and Kodi's 30 s give-up expired while the duplicate was
-    still in flight — the segment arrived 25 s after the player had given up. Now the
-    first caller downloads and everybody else waits for its result."""
-
-    cached = _ptv_cache_get(key)
-    if cached is not None:
-        return cached
-
-    def _download():
-        body = _ptv_download(url, origin)
-        if body is None:
-            return None
-        return _ptv_decode(key, body)
-
-    if _shutting_down():
-        # Same reason as in fetch_via_proxy: Kodi kills the interpreter five seconds
-        # after asking it to stop, and a fresh multi-megabyte download is exactly
-        # what would still be running when that happens.
-        return _ptv_cache_get(key)
-
-    with _ptv_flight_lock:
-        ev = _ptv_flight.get(key)
-        owner = ev is None
-        if owner:
-            ev = threading.Event()
-            _ptv_flight[key] = ev
-    if not owner:
-        # Someone else is already fetching this exact segment: wait for their bytes
-        # rather than opening a second connection for the same payload.
-        ev.wait(timeout=_PTV_SEGMENT_TIMEOUT + 10)
-        return _ptv_cache_get(key)
-    try:
-        return _download()
-    finally:
-        with _ptv_flight_lock:
-            _ptv_flight.pop(key, None)
-        ev.set()
-
 
 def _ptv_await_segment(key, timeout):
     """Return the bytes of a segment another thread is already downloading, or None
@@ -1712,7 +1669,15 @@ def _ptv_prefetch_start(urls, origin):
                 _ptv_prefetch_busy = False
 
     t = threading.Thread(target=_run, daemon=True)
-    t.start()
+    try:
+        t.start()
+    except Exception as e:
+        # The busy flag is cleared by the thread itself; if the thread never starts
+        # it would stay raised and the prefetch would be disabled for the session.
+        global _ptv_prefetch_busy
+        with _ptv_prefetch_lock:
+            _ptv_prefetch_busy = False
+        log(f'[PremiumTVPrefetch] thread not started: {type(e).__name__}')
 
 
 def _ptv_cache_get(key):
@@ -3367,6 +3332,10 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                             body = sr.content
                             seen_urls.add(seg_url)
                             seg_dur = seg_dur_map.get(seg_url, tgt_dur)
+                            # The PCR repair was written for exactly this path and
+                            # got disconnected in a refactor: without it Kodi's
+                            # VideoPlayer uses a garbage clock and stutters hard.
+                            body = _fix_lovecdn_pcr(body, seg_dur)
                             while not _client_gone.is_set() and not _proxy_abort.is_set():
                                 try:
                                     _seg_q.put((body, seg_dur), timeout=0.5)
@@ -5248,6 +5217,16 @@ def _refresh_xmltv(cid_name_pairs):
     source file that is not a valid archive is downloaded anew."""
     if not cid_name_pairs:
         return False
+    # The favourites list refreshes the EPG on its own when the cache is stale, and
+    # the channel check asks for a refresh too: parsing a five megabyte XML twice in
+    # a row is pure waste, so a very recent refresh is left alone.
+    try:
+        if os.path.exists(_XMLTV_PROG_CACHE) and \
+                time.time() - os.path.getmtime(_XMLTV_PROG_CACHE) < 120:
+            log('[xmltv] EPG refreshed moments ago — kept')
+            return False
+    except OSError:
+        pass
     try:
         try:
             os.remove(_XMLTV_PROG_CACHE)
@@ -6660,10 +6639,10 @@ def _wide_freshen_url(raw_url, slug):
 def _wide_probe(manifest_url, slug, timeout=6):
     """Prove a wideiptv stream actually delivers video, not just that the host answers.
 
-    _cdn_reachable only asks the CDN for a manifest, and it answers "yes" on nodes that
-    then hand Kodi a playlist it cannot open: measured on the same log, 6 of 8 launches
-    ended in Kodi's "Error creating demuxer" after its 30 s give-up, while DLTV had
-    already logged "Stream started". Walking the chain here — media playlist, then the
+    A manifest GET alone is not enough: a node can answer it and still hand Kodi a
+    playlist it cannot open. Measured on the same log, 6 of 8 launches ended in
+    Kodi's "Error creating demuxer" after its 30 s give-up, while DLTV had already
+    logged "Stream started". Walking the chain here — media playlist, then the
     first segment, checked for MPEG-TS — costs one extra fetch on a healthy node and
     catches the case where the CDN is up but the stream is not.
     """
@@ -7108,7 +7087,7 @@ def _save_upstream_dead():
 
 def _upstream_alive(url, referer=None, timeout=6):
     """Cheap liveness probe for non-HLS upstreams (CHEVY serves pseudo-playlists with a
-    .css extension, so _cdn_reachable's #EXTM3U test cannot apply).
+    .css extension, so the #EXTM3U test used for wideiptv does not apply here).
 
     Any HTTP answer counts as alive — including 4xx/5xx — because what matters here is
     only whether the host completes a TLS handshake and answers at all. Negative results
@@ -7140,119 +7119,6 @@ def _upstream_alive(url, referer=None, timeout=6):
     return True
 
 
-_cdn_health = {}                # host -> (reachable: bool, timestamp), mirrored to disk
-_cdn_health_lock = threading.Lock()
-# A node that refuses connections stays dead for the whole outage, but the probe was
-# being repeated for every channel: measured 6 consecutive probes over 252 s on one
-# outage, each costing ~17 s before the fallback. One verdict per host per window is
-# enough — the node does not come back mid-zap.
-_CDN_HEALTH_TTL = 60
-
-
-_WIDE_NODE_TTL = 300           # how long a "this node does not serve" verdict holds
-
-
-def _wide_node_verdict(host):
-    """Last verdict for a wideiptv CDN node, read from disk so it survives the
-    interpreter Kodi restarts for every channel. Returns True (serves), False (does
-    not) or None (unknown)."""
-    try:
-        with open(_PAGE_CACHE_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        nodes = data.get(_WIDE_NODES_KEY) if isinstance(data, dict) else None
-        entry = nodes.get(host) if isinstance(nodes, dict) else None
-        if isinstance(entry, (list, tuple)) and len(entry) == 2:
-            ok, ts = bool(entry[0]), float(entry[1])
-            if time.time() - ts < _WIDE_NODE_TTL:
-                return ok
-    except Exception:
-        pass
-    return None
-
-
-def _wide_node_record(host, ok):
-    try:
-        with open(_PAGE_CACHE_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except Exception:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    nodes = data.get(_WIDE_NODES_KEY) if isinstance(data, dict) else None
-    if not isinstance(nodes, dict):
-        nodes = {}
-    nodes[host] = [bool(ok), time.time()]
-    data[_WIDE_NODES_KEY] = nodes
-    _dir = os.path.dirname(_PAGE_CACHE_FILE)
-    fd, tmp_path = tempfile.mkstemp(dir=_dir)
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(data, f)
-        _atomic_replace(tmp_path, _PAGE_CACHE_FILE)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-
-
-def _cdn_verdict(host):
-    """Recent probe result for a host, or None when it must be probed."""
-    if not host:
-        return None
-    with _cdn_health_lock:
-        entry = _cdn_health.get(host)
-    if entry and time.time() - entry[1] < _CDN_HEALTH_TTL:
-        return entry[0]
-    return None
-
-
-def _cdn_record(host, ok):
-    if not host:
-        return
-    with _cdn_health_lock:
-        _cdn_health[host] = (ok, time.time())
-
-
-def _cdn_reachable(url, referer=None, timeout=6, attempts=1):
-    """Probe a CDN manifest: True only when it answers 200 with a real HLS playlist.
-
-    Some CDN nodes (ds164.bluetier.top) drop roughly two connections in three yet serve
-    perfectly good HLS when they answer, so connection-level failures are retried while
-    an HTTP verdict (403/404/not-a-playlist) is returned immediately — retrying that
-    would only waste the delay before falling through to the next backend."""
-    host = urlparse(url).hostname or ''
-    known = _cdn_verdict(host)
-    if known is not None:
-        log(f'[CDNProbe] {host} known {"up" if known else "down"} from the last '
-            f'{int(time.time() - _cdn_health[host][1])}s — no probe')
-        return known
-    hdrs = {'User-Agent': UA}
-    if referer:
-        hdrs['Referer'] = referer
-    for i in range(max(1, attempts)):
-        try:
-            r = _get_session().get(url, headers=hdrs, timeout=timeout)
-        except Exception as e:
-            if i + 1 < attempts:
-                log(f'[CDNProbe] {type(e).__name__} — retry {i + 2}/{attempts}: {url[:70]}')
-                time.sleep(0.8)
-                continue
-            log(f'[CDNProbe] unreachable {type(e).__name__} after {attempts} try: {url[:70]}')
-            _cdn_record(host, False)
-            return False
-        if r.status_code != 200:
-            log(f'[CDNProbe] HTTP {r.status_code}: {url[:90]}')
-            _cdn_record(host, False)
-            return False
-        if not r.text[:400].lstrip().startswith('#EXTM3U'):
-            log(f'[CDNProbe] not a playlist (first bytes: {r.content[:16]!r}): {url[:90]}')
-            _cdn_record(host, False)
-            return False
-        _cdn_record(host, True)
-        return True
-    _cdn_record(host, False)
-    return False
 
 
 def _load_wide_slug_cache():
@@ -7733,26 +7599,11 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
         elif ap_result:
             real_m3u8_url, player_origin = ap_result
             log(f'[PlayStream] AnyPlayer URL: {real_m3u8_url} (origin={player_origin})')
-            # When the player hands back a wideiptv CDN URL, it has to be checked
-            # before Kodi gets it. The wideiptv backend had just measured that node
-            # as refusing the segments, and this path handed the very same dead URL
-            # to Kodi, which then failed with "Error creating demuxer" five seconds
-            # later. A URL that was proven broken must not be passed on.
-            _ap_host = urlparse(real_m3u8_url).hostname or ''
-            if _ap_host and ('bluetier' in _ap_host or 'wideiptv' in _ap_host):
-                _ap_slug = ''
-                _parts = [x for x in urlparse(real_m3u8_url).path.split('/') if x]
-                if len(_parts) >= 2:
-                    _ap_slug = _parts[1]
-                if _ap_slug and not _wide_probe(real_m3u8_url, _ap_slug):
-                    log(f'[PlayStream] AnyPlayer wideiptv URL refused by the node '
-                        f'({_ap_host}) — not handing a dead URL to Kodi')
-                    real_m3u8_url = None
-                    ap_result = None
-                else:
-                    log(f'[PlayStream] AnyPlayer wideiptv URL verified on {_ap_host}')
-            if ap_result:
-                use_player6 = True
+            # The wideiptv URL was already verified by _wide_url_usable above, before
+            # this branch: probing it a second time here would download the first
+            # segment twice per channel, and clearing ap_result from inside this
+            # branch would skip the ksohls/CHEVY fallback below.
+            use_player6 = True
         else:
             # AnyPlayer failed — try ksohls auth before noauth (noauth often returns placeholder images)
             log('[PlayStream] AnyPlayer failed — trying ksohls auth before noauth fallback')
@@ -7836,11 +7687,10 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
         _wide_fresh_token(w_slug, w_token)
         _ensure_m3u8_proxy()
         # The wideiptv CDN nodes go down regularly (ds164.bluetier.top started
-        # refusing TCP). _wide_probe already walks manifest → media playlist →
-        # first segment and checks the bytes are MPEG-TS, which tells us strictly
-        # more than _cdn_reachable's single manifest GET. Keeping both meant two
-        # round trips to the same host for the same verdict, and connections are
-        # the scarce resource here — hence one probe, not two.
+        # refusing TCP). _wide_probe walks manifest → media playlist → first segment
+        # and checks the bytes are MPEG-TS, which tells us strictly more than a
+        # single manifest GET would — and connections are the scarce resource
+        # here, so there is one probe, not two.
         if not _wide_probe(w_url, w_slug):
             # The node answered the manifest but refused the segment. The site keeps
             # advertising it, so try the other nodes it has used before: the token
