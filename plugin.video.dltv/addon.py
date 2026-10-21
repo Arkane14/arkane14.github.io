@@ -1,4 +1,4 @@
-# version: 1.2.74 (must match addon.xml)
+# version: 1.2.75 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -27,6 +27,7 @@ import struct
 import random
 import requests
 import threading
+import queue
 from itertools import islice
 import tempfile
 import concurrent.futures
@@ -1602,6 +1603,77 @@ def _ptv_await_segment(key, timeout):
 _ptv_prefetch_busy = False
 _ptv_prefetch_lock = threading.Lock()
 
+# Two-stage pipeline: a downloader thread and a decoder thread, so the transfer of
+# one segment overlaps the PNG unwrap of the previous one. The measured cost on the
+# tablet was 4.5 s of transfer plus 3 s of Python unwrap for a 5.76 s segment: in
+# series that is 7.5 s per segment, which is why the high-bitrate channels drifted
+# while the others did not. Overlapped it is max(4.5, 3) = 4.5 s.
+_ptv_dl_q = queue.Queue(maxsize=2)      # (url, origin) to download
+_ptv_raw_q = queue.Queue(maxsize=2)     # (key, body) downloaded, to decode
+_ptv_pipe_lock = threading.Lock()
+_ptv_pipe_started = False
+
+
+def _ptv_pipe_downloader():
+    while True:
+        try:
+            url, origin = _ptv_dl_q.get(timeout=30)
+        except queue.Empty:
+            return
+        key = url.split('?', 1)[0]
+        # Announce the segment as being fetched, so the serving path waits for it
+        # instead of downloading the same megabytes a second time.
+        with _ptv_flight_lock:
+            ev = _ptv_flight.get(key)
+            if ev is None:
+                ev = threading.Event()
+                _ptv_flight[key] = ev
+        body = None
+        try:
+            body = _ptv_download(url, origin)
+        except Exception as e:
+            log(f'[PremiumTVPipe] download error: {type(e).__name__}')
+        if body:
+            try:
+                _ptv_raw_q.put((key, body, ev), timeout=30)
+            except queue.Full:
+                ev.set()
+        else:
+            ev.set()
+
+
+def _ptv_pipe_decoder():
+    while True:
+        try:
+            key, body, ev = _ptv_raw_q.get(timeout=30)
+        except queue.Empty:
+            return
+        try:
+            ts = _ptv_decode(key, body)
+            if ts:
+                log(f'[PremiumTVPipe] segment {len(ts)}B decoded in advance')
+        except Exception as e:
+            log(f'[PremiumTVPipe] decode error: {type(e).__name__}')
+        finally:
+            with _ptv_flight_lock:
+                _ptv_flight.pop(key, None)
+            if ev is not None:
+                ev.set()
+
+
+def _ptv_pipe_start():
+    global _ptv_pipe_started
+    with _ptv_pipe_lock:
+        if _ptv_pipe_started:
+            return
+        _ptv_pipe_started = True
+    for target in (_ptv_pipe_downloader, _ptv_pipe_decoder):
+        t = threading.Thread(target=target, daemon=True)
+        try:
+            t.start()
+        except Exception as e:
+            log(f'[PremiumTVPipe] worker not started: {type(e).__name__}')
+
 
 def _ptv_prefetch(urls, origin):
     """Pull the next segment ahead of ISA — one at a time, and only if it helps.
@@ -1629,7 +1701,10 @@ def _ptv_prefetch(urls, origin):
             log('[PremiumTVPrefetch] already running, segment skipped')
             return
         _ptv_prefetch_busy = True
-    _ptv_prefetch_start(wanted[:1], origin)
+    # Two segments: the downloader fetches the next one while the decoder unwraps
+    # the previous. Downloads stay serialised — one downloader thread — so this
+    # costs no extra bandwidth, only the overlap the two stages can give.
+    _ptv_prefetch_start(wanted[:2], origin)
 
 
 def _ptv_prefetch_start(urls, origin):
@@ -1645,19 +1720,13 @@ def _ptv_prefetch_start(urls, origin):
         key = u.split('?', 1)[0]
         if _ptv_cache_get(key) is not None:
             return
-        t0 = time.time()
-        # Download and decode on separate threads. The measured pipeline on the
-        # tablet was 4.5 s of transfer plus 3 s of Python unwrap; run in series that
-        # is 7.5 s for a 5.76 s segment, which is why the high-bitrate channels
-        # drifted and the others did not. Overlapped, it is max(4.5, 3).
-        body = _ptv_download(u, origin_page)
-        if body is None:
-            return
-        t1 = time.time()
-        ts = _ptv_decode(key, body)
-        if ts:
-            log(f'[PremiumTVPrefetch] segment {len(ts)}B '
-                f'{(t1 - t0) * 1000:.0f} ms + {(time.time() - t1) * 1000:.0f} ms')
+        # The download and the unwrap happen in two different workers, so the
+        # transfer of this segment overlaps the decoding of the previous one.
+        _ptv_pipe_start()
+        try:
+            _ptv_dl_q.put_nowait((u, origin_page))
+        except queue.Full:
+            log('[PremiumTVPrefetch] pipeline busy, segment deferred')
 
     def _run():
         try:
@@ -2900,12 +2969,21 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 _code = 200 if _body else 502
                 _final, _rh = raw_url, {}
             else:
-                # 15 s, not 5: a premiumtv segment is ~3.4 MB and the measured
-                # throughput on that host is 0.74-1.17 Mo/s, so a healthy fetch
-                # already takes up to 4.6 s. A 5 s budget turned ordinary slowness
-                # into "Read timed out" and a dead stream.
-                _code, _body, _final, _rh = _ptv_fetch(raw_url, origin, _cdn_host,
-                                                      timeout=_PTV_SEGMENT_TIMEOUT)
+                # A segment the prefetch already decoded is served straight from the
+                # cache. The old order fetched the 3.4 MB first and only then looked
+                # at the cache, throwing the fresh copy away — so every single
+                # premiumtv segment travelled twice when the prefetch was working.
+                _ckey = raw_url.split('?', 1)[0]
+                _cached = _ptv_cache_get(_ckey)
+                if _cached is not None:
+                    _code, _body, _final, _rh = 200, _cached, raw_url, {}
+                else:
+                    # 15 s, not 5: a premiumtv segment is ~3.4 MB and the measured
+                    # throughput on that host is 0.74-1.17 Mo/s, so a healthy fetch
+                    # already takes up to 4.6 s. A 5 s budget turned ordinary slowness
+                    # into "Read timed out" and a dead stream.
+                    _code, _body, _final, _rh = _ptv_fetch(raw_url, origin, _cdn_host,
+                                                          timeout=_PTV_SEGMENT_TIMEOUT)
             hdrs = {'Referer': origin if '?' in origin else origin.rstrip('/') + '/'}
             referer = hdrs['Referer']
 
