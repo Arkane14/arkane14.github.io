@@ -1,4 +1,4 @@
-# version: 1.2.76 (must match addon.xml)
+# version: 1.2.77 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -6727,6 +6727,39 @@ def _wide_freshen_url(raw_url, slug):
     qs = [(k, v) for k, v in qs if k != 'token']
     qs.append(('token', _wide_fresh_token(slug)))
     return base_url + '?' + urlencode(qs)
+
+
+def _wide_node_verdict(host):
+    """Last verdict for a wideiptv CDN node, read from disk so it survives the
+    interpreter Kodi restarts for every channel. Returns True (serves), False (does
+    not) or None (unknown)."""
+    try:
+        data = _load_page_cache()
+        nodes = data.get(_WIDE_NODES_KEY) if isinstance(data, dict) else None
+        entry = nodes.get(host) if isinstance(nodes, dict) else None
+        if isinstance(entry, (list, tuple)) and len(entry) == 2:
+            ok, ts = bool(entry[0]), float(entry[1])
+            if time.time() - ts < _WIDE_NODE_TTL:
+                return ok
+    except Exception:
+        pass
+    return None
+
+
+def _wide_node_record(host, ok):
+    """Remember whether a wideiptv CDN node served a usable stream."""
+    try:
+        data = _load_page_cache()
+        if not isinstance(data, dict):
+            data = {}
+        nodes = data.get(_WIDE_NODES_KEY)
+        if not isinstance(nodes, dict):
+            nodes = {}
+        nodes[host] = [bool(ok), time.time()]
+        data[_WIDE_NODES_KEY] = nodes
+        _save_page_cache(data)
+    except Exception:
+        pass
 
 
 def _wide_probe(manifest_url, slug, timeout=6):
