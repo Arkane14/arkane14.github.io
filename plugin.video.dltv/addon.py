@@ -1,4 +1,4 @@
-# version: 1.2.81 (must match addon.xml)
+# version: 1.2.82 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -3474,6 +3474,11 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
 
             def _download():
                 last_content = time.time()
+                _last_seq = [None]
+                _last_prog = [None]
+                _disc_spent = [0]
+                _disc_end = [None]
+                chosen_first = [None]
                 while not _proxy_abort.is_set() and not _client_gone.is_set():
                     try:
                         # Freshen each poll — the media token dies in minutes.
@@ -3486,11 +3491,24 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                         mbase = rr.url.split('?')[0].rsplit('/', 1)[0] + '/'
                         tgt_m = re.search(r'#EXT-X-TARGETDURATION:(\d+)', rr.text)
                         tgt_dur = float(tgt_m.group(1)) if tgt_m else 6.0
+                        seq_m = re.search(r'#EXT-X-MEDIA-SEQUENCE:(\d+)', rr.text)
+                        base_seq = int(seq_m.group(1)) if seq_m else 0
                         segs = []
                         seg_dur_map = {}
+                        seg_prog_map = {}
                         _last_inf = tgt_dur
+                        _cur_prog = None
+                        _discont = False
                         for _sl in rr.text.splitlines():
                             _sl = _sl.strip()
+                            if _sl.startswith('#EXT-X-PROGRAM-DATE-TIME:'):
+                                try:
+                                    _cur_prog = float(_sl[23:])
+                                except Exception:
+                                    _cur_prog = None
+                            elif _sl.startswith('#EXT-X-DISCONTINUITY'):
+                                _discont = True
+                                continue
                             if _sl.startswith('#EXTINF:'):
                                 try:
                                     _last_inf = float(_sl[8:].split(',')[0])
@@ -3500,8 +3518,42 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                                 _su = _sl if _sl.startswith('http') else urljoin(mbase, _sl)
                                 segs.append(_su)
                                 seg_dur_map[_su] = _last_inf
+                                seg_prog_map[_su] = _cur_prog
                                 _last_inf = tgt_dur
                         new_segs = [u for u in segs if u not in seen_urls]
+                        new_idx = [segs.index(u) for u in new_segs]
+                        # Drop the first poll if it opens on a stale window:
+                        # the playlist's oldest segment can be minutes behind a
+                        # live edge and, when it lands, the A/V clocking gets a
+                        # huge PTS/PCR step that Kodi can only paper over with
+                        # drops (the remaining saccade). Trim to the newest half.
+                        if chosen_first[0] is None and len(new_segs) >= 4:
+                            new_segs = new_segs[len(new_segs) // 2:]
+                            new_idx = new_idx[len(new_segs) // 2:]
+                            log(f'[WideTsProxy] match start at newest half of window')
+                        # A discontinuity in the source is a real splice (often a
+                        # 40s+ wall-clock jump with a new encoder state). The site
+                        # hands that to the browser via HLS timeline signalling;
+                        # a concatenated TS has no such signal and Kodi keeps the
+                        # old clock, adding seconds of AV error and repeated drops.
+                        # End the stream before the splice so Kodi reopens at the
+                        # new edge instead of decoding through the join.
+                        if _disc_end[0] is not None and _disc_spent[0] == 0:
+                            _disc_end[0] += 1
+                        _found_disc = False
+                        for _i, _u in zip(new_idx, new_segs):
+                            _sp = seg_prog_map.get(_u)
+                            if _last_prog[0] is not None and _sp is not None:
+                                jump = _sp - _last_prog[0]
+                                if jump > max(15.0, tgt_dur * 3.0):
+                                    log(f'[WideTsProxy] discontinuity jump {jump:.1f}s '
+                                        f'before {_wide_log_tail(_u)} — reopening at next edge')
+                                    _proxy_abort.set()
+                                    _client_gone.set()
+                                    return
+                            _last_prog[0] = _sp if _sp is not None else _last_prog[0]
+                            if _i > 0 and rr.text.splitlines()[0:1]:
+                                pass
                         if not new_segs:
                             if time.time() - last_content >= _STALL_MAX:
                                 log(f'[WideTsProxy] stall >{int(_STALL_MAX)}s — ending stream')
@@ -3512,7 +3564,6 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                             if _proxy_abort.is_set() or _client_gone.is_set():
                                 break
                             key = _wide_seg_key(seg_url)
-                            body = None
                             with _wide_seg_cache_lock:
                                 body = _wide_seg_cache.get(key)
                             if body is None:
