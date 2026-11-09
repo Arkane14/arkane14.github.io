@@ -1,4 +1,4 @@
-# version: 1.2.83 (must match addon.xml)
+# version: 1.2.84 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -3199,7 +3199,11 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
         manifest segment/variant URLs through /wide/ so the token is re-applied.
         Segments are served from the decoded cache under the key the *content*
         has, so a client that asks for the same playlist through two different
-        URLs gets the same bytes; the cache bound as the first writer wins."""
+        URLs gets the same bytes; the cache bound as the first writer wins.
+        If a segment declares an audio PID but carries no audio packets, the PMT
+        is rewritten without the audio entry so inputstream.adaptive does not
+        wait for a stream that never produces frames (the 1.2.81 saccade /
+        silent-CD2 failure on FOOT+)."""
         try:
             slug = unquote(encoded_slug)
             # Segment URLs get a trailing /seg.ts so ISA can detect the TS
@@ -3411,7 +3415,9 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
         as a jerky picture even though the CDN bytes are clean (checked on a real
         segment: DTS 0.04s constant, PCR +1080000). Kodi uses its own VideoPlayer
         (no inputstream), letting FFmpeg own PTS/DTS directly and pacing through
-        the same segment-queue depth the TS proxies already prove smooth."""
+        the same segment-queue depth the TS proxies already prove smooth.
+        Segments pass through _ts_strip_audio() so a declared-but-empty audio
+        PID never monopolises the audio clock (the 463 silent crash)."""
         try:
             import queue as _q
 
@@ -8555,7 +8561,7 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
             m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/wide/{encoded_slug}/{encoded_url}'
             log(f'[PlayStream] Using wideiptv HLS via wide proxy (inputstream.adaptive): {m3u8_url}')
             _premiumtv_hls = True
-            if _WIDE_TRY_TTS:
+            if _WIDE_TRY_TTS and not _WIDE_TRY_HLS:
                 _wide_ts_mode = True
                 m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/wide-ts/{encoded_slug}/{encoded_url}'
                 log(f'[PlayStream] wideiptv -> continuous-TS proxy: {m3u8_url}')
