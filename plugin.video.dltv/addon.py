@@ -1,4 +1,4 @@
-# version: 1.2.77 (must match addon.xml)
+# version: 1.2.81 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -649,6 +649,7 @@ _PTV_PREFETCH_AHEAD = 2      # segments fetched while ISA opens the playlist
 _wide_seg_cache = {}            # seg_key -> bytes (wideiptv pre-downloaded segments)
 _wide_seg_cache_lock = threading.Lock()
 _wide_seg_queued = set()        # seg_key currently being prefetched
+_wide_seg_events = {}           # seg_key -> Event set when its prefetch finishes
 _wide_slug_cache = {}           # channel id -> {slug, url, token, ts}
 _wide_slug_lock = threading.Lock()
 _wide_slug_absent = {}          # slug -> timestamp, CDN has no content for it
@@ -675,6 +676,8 @@ _WIDE_FETCH_ATTEMPTS = 6
 # was still coming. The premiumtv path already uses 15 s for the same reason.
 _WIDE_SEGMENT_TIMEOUT = 20
 _wide_dead_segs = {}            # seg_key -> expiry, for segments the CDN does not have
+_wide_media_audio = {}          # decoded media playlist key -> True/False (audio PID carries packets)
+_WIDE_TRY_TTS = True           # route wideiptv through the continuous-TS proxy (see _resolve_playback)
 _wide_seg_keys = []             # insertion order, for bounded eviction
 _WIDE_SEG_CACHE_MAX = 8         # ~5 MB each at 1080p — keep memory in check
 _WIDE_PREFETCH_AHEAD = 6        # how many upcoming segments to chase per playlist
@@ -711,6 +714,9 @@ def _wide_cache_store(key, body):
     with _wide_seg_cache_lock:
         if key not in _wide_seg_cache:
             _wide_seg_keys.append(key)
+        else:
+            # Same content under a refreshed token: the first writer wins.
+            return
         _wide_seg_cache[key] = body
         while len(_wide_seg_keys) > _WIDE_SEG_CACHE_MAX:
             _wide_seg_cache.pop(_wide_seg_keys.pop(0), None)
@@ -744,6 +750,7 @@ def _wide_prefetch_seg(seg_url, slug, attempts=6):
             return
         # Claim the slot atomically, then do every network call outside the lock.
         _wide_seg_queued.add(key)
+        event = _wide_seg_events[key] = threading.Event()
     try:
         hdrs = {'User-Agent': UA, 'Referer': f'https://wideiptv.top/player/{slug}'}
         # Same fresh-token rebuild as the proxy path: the playlist's own token is
@@ -773,6 +780,8 @@ def _wide_prefetch_seg(seg_url, slug, attempts=6):
     finally:
         with _wide_seg_cache_lock:
             _wide_seg_queued.discard(key)
+            _wide_seg_events.pop(key, None)
+        event.set()
 
 
 def _wide_mark_dead(key, ttl=_WIDE_DEAD_TTL):
@@ -1917,6 +1926,10 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
         m = re.match(r'^/wide/([^/]+)/(.+)', self.path)
         if m:
             self._handle_wide(m.group(1), m.group(2))
+            return
+        m = re.match(r'^/wide-ts/([^/]+)/(.+)', self.path)
+        if m:
+            self._handle_wide_ts(m.group(1), m.group(2))
             return
         m = re.match(r'^/lovecdn/([^/?]+)', self.path)
         if m:
@@ -3181,9 +3194,16 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
     def _handle_wide(self, encoded_slug, encoded_url):
         """Serve a wideiptv (Player 6) HLS playlist/segment for inputstream.adaptive.
         Fetches with a fresh token (auto-refreshed via the wideiptv API), rewrites
-        manifest segment/variant URLs through /wide/ so the token is re-applied."""
+        manifest segment/variant URLs through /wide/ so the token is re-applied.
+        Segments are served from the decoded cache under the key the *content*
+        has, so a client that asks for the same playlist through two different
+        URLs gets the same bytes; the cache bound as the first writer wins."""
         try:
             slug = unquote(encoded_slug)
+            # Segment URLs get a trailing /seg.ts so ISA can detect the TS
+            # container from the media URL; strip it before decoding the real URL.
+            if encoded_url.endswith('/seg.ts'):
+                encoded_url = encoded_url[:-len('/seg.ts')]
             raw_url = unquote(encoded_url)
             if not raw_url.startswith('http'):
                 log(f'[WideIptvProxy] relative URL rejected: {raw_url}')
@@ -3207,6 +3227,7 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
             # looking here *after* fetching would defeat the whole buffer.
             with _wide_seg_cache_lock:
                 _cached = _wide_seg_cache.get(seg_key)
+                _wait_event = _wide_seg_events.get(seg_key) if _cached is None else None
             if _cached is not None:
                 log(f'[WideIptvProxy] seg from buffer {len(_cached)}B {_wide_log_tail(fetch_url)}')
                 self.send_response(200)
@@ -3215,6 +3236,23 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(_cached)
                 return
+            if _wait_event is not None:
+                # A prefetch thread is already downloading this exact segment.
+                # Waiting for it avoids a second request on a CDN that refuses
+                # roughly half the connections it receives. If the prefetch is
+                # slow or fails, fall through and fetch it ourselves.
+                _wait_event.wait(2.0)
+                with _wide_seg_cache_lock:
+                    _cached = _wide_seg_cache.get(seg_key)
+                if _cached is not None:
+                    log(f'[WideIptvProxy] seg from prefetch {len(_cached)}B '
+                        f'{_wide_log_tail(fetch_url)}')
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'video/MP2T')
+                    self.send_header('Content-Length', str(len(_cached)))
+                    self.end_headers()
+                    self.wfile.write(_cached)
+                    return
             r = None
             _host = urlparse(fetch_url).hostname or ''
             # The wideiptv CDN refuses roughly one connection in two (measured on
@@ -3277,14 +3315,74 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
             port = _actual_proxy_port or M3U8_PROXY_PORT
             base = r.url.split('?')[0].rsplit('/', 1)[0] + '/'
             enc_slug = quote_plus(slug)
+            raw_lines = r.text.splitlines()
+            # A wideiptv master playlist advertises mp4a in CODECS without an
+            # AUDIO group, so ISA marks audio as included in the video stream and
+            # its TS reader requires an audio PID. Some CDN nodes now serve
+            # video-only segments (the PMT still lists an audio PID, but no packet
+            # carries it), so that reader never initialises and Kodi dies with
+            # "Codec id 27 require extradata". When the probe did not see audio,
+            # declare an explicit audio rendition: video no longer waits for
+            # audio, and audio still plays if a later segment muxes it.
+            master = any(ln.strip().startswith('#EXT-X-STREAM-INF') for ln in raw_lines)
+            audio_groups = {}
+            media_tags = []
+            has_audio_media = any(ln.strip().startswith('#EXT-X-MEDIA') and
+                                  'TYPE=AUDIO' in ln for ln in raw_lines)
+            if master and not has_audio_media:
+                variants = []
+                for idx, ln in enumerate(raw_lines):
+                    if not ln.strip().startswith('#EXT-X-STREAM-INF'):
+                        continue
+                    if 'AUDIO=' in ln:
+                        variants = []
+                        break
+                    for j in range(idx + 1, len(raw_lines)):
+                        uri = raw_lines[j].strip()
+                        if uri and not uri.startswith('#'):
+                            variants.append((idx, j, uri))
+                            break
+                if variants:
+                    first_media = variants[0][2]
+                    if not first_media.startswith('http'):
+                        first_media = urljoin(base, first_media)
+                    if _wide_media_audio.get(_wide_seg_key(first_media)) is not True:
+                        uri_groups = {}
+                        for tag_idx, _uri_idx, uri in variants:
+                            abs_uri = uri if uri.startswith('http') else urljoin(base, uri)
+                            group = uri_groups.get(abs_uri)
+                            if group is None:
+                                group = f'aud{len(uri_groups)}'
+                                uri_groups[abs_uri] = group
+                                proxy_uri = (f'http://127.0.0.1:{port}/wide/{enc_slug}/'
+                                             f'{quote_plus(abs_uri)}')
+                                media_tags.append(
+                                    f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="{group}",'
+                                    f'NAME="audio",DEFAULT=YES,AUTOSELECT=YES,'
+                                    f'URI="{proxy_uri}"')
+                            audio_groups[tag_idx] = group
+                        log(f'[WideIptvProxy] {slug}: audio not seen in segments — '
+                            f'declaring a separate audio rendition')
             lines = []
             abs_segs = []
-            for line in r.text.splitlines():
+            start = 0
+            if media_tags:
+                if raw_lines and raw_lines[0].strip().startswith('#EXTM3U'):
+                    lines.append(raw_lines[0])
+                    lines.extend(media_tags)
+                    start = 1
+                else:
+                    lines.extend(media_tags)
+            for idx in range(start, len(raw_lines)):
+                line = raw_lines[idx]
                 stripped = line.strip()
                 if stripped and not stripped.startswith('#'):
                     abs_seg = stripped if stripped.startswith('http') else urljoin(base, stripped)
                     abs_segs.append(abs_seg)
-                    lines.append(f'http://127.0.0.1:{port}/wide/{enc_slug}/{quote_plus(abs_seg)}')
+                    lines.append(f'http://127.0.0.1:{port}/wide/{enc_slug}/'
+                                 f'{quote_plus(abs_seg)}/seg.ts')
+                elif idx in audio_groups:
+                    lines.append(f'{line.rstrip().rstrip(",")},AUDIO="{audio_groups[idx]}"')
                 else:
                     lines.append(line)
             _wide_prefetch_ahead(abs_segs, slug)
@@ -3296,6 +3394,238 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except Exception as e:
             log(f'[WideIptvProxy] error: {e}')
+            try:
+                self.send_response(502)
+                self.end_headers()
+            except Exception:
+                pass
+
+    def _handle_wide_ts(self, encoded_slug, encoded_url):
+        """Serve wideiptv as a continuous MPEG-TS byte stream (same pacing the
+        CHEVY/lovecdn TS proxies use). The HLS/ISA path serialises every segment
+        through two demuxers: the proxy fetches, then ISA re-demuxes and re-polls
+        per stream. With live-edge bandwidth bursts the ISA buffer drains, and
+        the TSReader blocks while a full segment is downloaded, which Kodi shows
+        as a jerky picture even though the CDN bytes are clean (checked on a real
+        segment: DTS 0.04s constant, PCR +1080000). Kodi uses its own VideoPlayer
+        (no inputstream), letting FFmpeg own PTS/DTS directly and pacing through
+        the same segment-queue depth the TS proxies already prove smooth."""
+        try:
+            import queue as _q
+
+            slug = unquote(encoded_slug)
+            if encoded_url.endswith('/seg.ts'):
+                encoded_url = encoded_url[:-len('/seg.ts')]
+            raw_url = unquote(encoded_url)
+            if not raw_url.startswith('http'):
+                log(f'[WideTsProxy] relative URL rejected: {raw_url}')
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            # Resolve the master to the media playlist ISA would start on.
+            fetch_url = _wide_freshen_url(raw_url, slug)
+            hdrs = {'User-Agent': UA, 'Referer': f'https://wideiptv.top/player/{slug}'}
+            media_url = fetch_url
+            try:
+                r = requests.get(fetch_url, headers=hdrs, timeout=10)
+            except Exception as e:
+                log(f'[WideTsProxy] manifest unreachable ({type(e).__name__})')
+                self.send_response(502)
+                self.end_headers()
+                return
+            if r.status_code != 200 or r.content[:7] != b'#EXTM3U':
+                log(f'[WideTsProxy] manifest HTTP {r.status_code} or not a playlist')
+                self.send_response(502)
+                self.end_headers()
+                return
+            base = r.url.split('?')[0].rsplit('/', 1)[0] + '/'
+            lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
+            variants = [ln for ln in lines if ln and not ln.startswith('#')]
+            if variants and '#EXT-X-STREAM-INF' in r.text:
+                media_url = _wide_freshen_url(urljoin(r.url, variants[0]), slug)
+                try:
+                    rm = requests.get(media_url, headers=hdrs, timeout=10)
+                except Exception as e:
+                    log(f'[WideTsProxy] media playlist unreachable ({type(e).__name__})')
+                    self.send_response(502)
+                    self.end_headers()
+                    return
+                if rm.status_code != 200 or rm.content[:7] != b'#EXTM3U':
+                    log(f'[WideTsProxy] media playlist HTTP {rm.status_code}')
+                    self.send_response(502)
+                    self.end_headers()
+                    return
+                media_url = rm.url
+            else:
+                media_url = r.url
+            # The slug cache never refreshes while this connection is open, so the
+            # media playlist URL the worker polls must carry the freshened token.
+            if '?token=' not in media_url:
+                media_url = media_url.split('?', 1)[0] + '?' + urlencode([
+                    ('token', _wide_fresh_token(slug))])
+
+            seen_urls = set()
+            _seg_q = _q.Queue(maxsize=10)
+            _client_gone = threading.Event()
+            _NULL_PKT = bytes([0x47, 0x1F, 0xFF, 0x10]) + bytes(184)
+            _PRE_BUFFER_MAX = 20.0
+            _STALL_MAX = 30.0
+
+            def _download():
+                last_content = time.time()
+                while not _proxy_abort.is_set() and not _client_gone.is_set():
+                    try:
+                        # Freshen each poll — the media token dies in minutes.
+                        poll_url = _wide_freshen_url(media_url, slug)
+                        rr = requests.get(poll_url, headers=hdrs, timeout=10)
+                        if rr.status_code != 200 or rr.content[:7] != b'#EXTM3U':
+                            log(f'[WideTsProxy] poll HTTP {rr.status_code}')
+                            _proxy_abort.wait(timeout=3)
+                            continue
+                        mbase = rr.url.split('?')[0].rsplit('/', 1)[0] + '/'
+                        tgt_m = re.search(r'#EXT-X-TARGETDURATION:(\d+)', rr.text)
+                        tgt_dur = float(tgt_m.group(1)) if tgt_m else 6.0
+                        segs = []
+                        seg_dur_map = {}
+                        _last_inf = tgt_dur
+                        for _sl in rr.text.splitlines():
+                            _sl = _sl.strip()
+                            if _sl.startswith('#EXTINF:'):
+                                try:
+                                    _last_inf = float(_sl[8:].split(',')[0])
+                                except Exception:
+                                    _last_inf = tgt_dur
+                            elif _sl and not _sl.startswith('#'):
+                                _su = _sl if _sl.startswith('http') else urljoin(mbase, _sl)
+                                segs.append(_su)
+                                seg_dur_map[_su] = _last_inf
+                                _last_inf = tgt_dur
+                        new_segs = [u for u in segs if u not in seen_urls]
+                        if not new_segs:
+                            if time.time() - last_content >= _STALL_MAX:
+                                log(f'[WideTsProxy] stall >{int(_STALL_MAX)}s — ending stream')
+                                break
+                            _proxy_abort.wait(timeout=tgt_dur / 2)
+                            continue
+                        for seg_url in new_segs:
+                            if _proxy_abort.is_set() or _client_gone.is_set():
+                                break
+                            key = _wide_seg_key(seg_url)
+                            body = None
+                            with _wide_seg_cache_lock:
+                                body = _wide_seg_cache.get(key)
+                            if body is None:
+                                furl = _wide_freshen_url(seg_url, slug)
+                                try:
+                                    sr = requests.get(furl, headers=hdrs,
+                                                      timeout=_WIDE_SEGMENT_TIMEOUT)
+                                except Exception as e:
+                                    log(f'[WideTsProxy] seg error: {e}')
+                                    continue
+                                if sr.status_code != 200:
+                                    log(f'[WideTsProxy] seg {sr.status_code}: '
+                                        f'{_wide_log_tail(seg_url)}')
+                                    continue
+                                body = sr.content
+                                if not _is_media_segment(body):
+                                    log(f'[WideTsProxy] non-media seg {len(body)}B '
+                                        f'{_wide_log_tail(seg_url)}')
+                                    continue
+                                _wide_cache_store(key, body)
+                            seen_urls.add(seg_url)
+                            seg_dur = seg_dur_map.get(seg_url, tgt_dur)
+                            while not _client_gone.is_set() and not _proxy_abort.is_set():
+                                try:
+                                    _seg_q.put((body, seg_dur), timeout=0.5)
+                                    break
+                                except _q.Full:
+                                    pass
+                            last_content = time.time()
+                    except Exception as e:
+                        log(f'[WideTsProxy] poll error: {e}')
+                        _proxy_abort.wait(timeout=2)
+                _seg_q.put(None)
+
+            _dl_t = threading.Thread(target=_download, daemon=True)
+            _dl_t.start()
+
+            _wait_start = time.time()
+            while _seg_q.qsize() < 2 and not _proxy_abort.is_set():
+                if time.time() - _wait_start > _PRE_BUFFER_MAX:
+                    log(f'[WideTsProxy] pre-buffer timeout')
+                    _client_gone.set()
+                    _dl_t.join(timeout=5)
+                    self.send_response(504)
+                    self.end_headers()
+                    return
+                time.sleep(0.05)
+
+            log(f'[WideTsProxy] {slug}: {_seg_q.qsize()} segs ready, starting stream')
+            try:
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/MP2T')
+                self.end_headers()
+            except Exception as e:
+                log(f'[WideTsProxy] header error: {e}')
+                _client_gone.set()
+                _dl_t.join(timeout=5)
+                return
+
+            def _sender():
+                _bps = 250000
+                _BURST_INTERVAL = 0.02
+                _pace_clock = None
+                while not _client_gone.is_set() and not _proxy_abort.is_set():
+                    if _pace_clock is not None:
+                        while not _client_gone.is_set() and not _proxy_abort.is_set():
+                            remaining = _pace_clock - time.time()
+                            if remaining <= 0:
+                                break
+                            time.sleep(min(remaining, _BURST_INTERVAL))
+                            n = max(1, int(_bps * _BURST_INTERVAL / 188))
+                            try:
+                                self.wfile.write(_NULL_PKT * n)
+                                self.wfile.flush()
+                            except (BrokenPipeError, OSError, ConnectionResetError):
+                                _client_gone.set()
+                                break
+                    if _client_gone.is_set() or _proxy_abort.is_set():
+                        break
+                    try:
+                        item = _seg_q.get(timeout=_BURST_INTERVAL)
+                    except _q.Empty:
+                        n = max(1, int(_bps * _BURST_INTERVAL / 188))
+                        try:
+                            self.wfile.write(_NULL_PKT * n)
+                            self.wfile.flush()
+                        except (BrokenPipeError, OSError, ConnectionResetError):
+                            _client_gone.set()
+                        continue
+                    if item is None:
+                        _seg_q.task_done()
+                        break
+                    seg_body, seg_dur = item
+                    _bps = max(12500, len(seg_body) / max(seg_dur, 0.1))
+                    try:
+                        self.wfile.write(seg_body)
+                        self.wfile.flush()
+                    except (BrokenPipeError, OSError, ConnectionResetError):
+                        log(f'[WideTsProxy] client disconnected')
+                        _client_gone.set()
+                        _seg_q.task_done()
+                        return
+                    now = time.time()
+                    _pace_clock = max(now, _pace_clock or now) + seg_dur
+                    _seg_q.task_done()
+
+            _sender_t = threading.Thread(target=_sender, daemon=True)
+            _sender_t.start()
+            _sender_t.join()
+            _client_gone.set()
+            _dl_t.join(timeout=5)
+        except Exception as e:
+            log(f'[WideTsProxy] error: {e}')
             try:
                 self.send_response(502)
                 self.end_headers()
@@ -6812,49 +7142,69 @@ def _wide_probe(manifest_url, slug, timeout=6):
     else:
         text, final = r.text, r.url
 
-    seg = next((ln for ln in text.splitlines()
-                if ln.strip() and not ln.startswith('#')), None)
-    if not seg:
+    # Probe the newest few segments: a single silent edge segment is a dropout,
+    # not proof that the node is video-only for the whole playback. Declaring
+    # the split rendition on one silent segment would make the dropout permanent.
+    segs = []
+    for ln in reversed(text.splitlines()):
+        s = ln.strip()
+        if s and not s.startswith('#') and s not in segs:
+            segs.append(s)
+        if len(segs) >= 3:
+            break
+    if not segs:
         _wide_node_record(host, False)
         log('[WideProbe] playlist carries no segment')
         return False
-    seg_url = _wide_freshen_url(urljoin(final, seg.strip()), slug)
-    _last_err = None
-    for attempt in range(_WIDE_FETCH_ATTEMPTS):
-        try:
-            rs = requests.get(seg_url, headers=hdrs,
-                              timeout=_WIDE_SEGMENT_TIMEOUT, stream=True)
-            # iter_content() is a generator, so it cannot be sliced: the slice
-            # raised TypeError on every attempt, the probe never measured
-            # anything, and every wideiptv node was written off as "not
-            # serving" — pushing the channel to the premiumtv fallback, which
-            # needs the portal, which is the scarce resource.
-            body = b''.join(islice(rs.iter_content(65536), 4))
-            rs.close()
+    has_audio = False
+    seen_media = False
+    for seg in segs:
+        seg_url = _wide_freshen_url(urljoin(final, seg), slug)
+        _last_err = None
+        body = b''
+        for attempt in range(_WIDE_FETCH_ATTEMPTS):
+            try:
+                rs = requests.get(seg_url, headers=hdrs,
+                                  timeout=_WIDE_SEGMENT_TIMEOUT, stream=True)
+                body = b''.join(islice(rs.iter_content(65536), 4))
+                rs.close()
+                break
+            except Exception as e:
+                # The reason was thrown away here, so the log only ever said
+                # "first segment unreachable" and the real cause stayed invisible.
+                _last_err = e
+                log(f'[WideProbe] segment attempt {attempt + 1}/{_WIDE_FETCH_ATTEMPTS} '
+                    f'failed ({type(e).__name__}: {str(e)[:50]})')
+                if attempt < _WIDE_FETCH_ATTEMPTS - 1:
+                    time.sleep(0.4)
+        else:
+            _wide_node_record(host, False)
+            log(f'[WideProbe] first segment unreachable after '
+                f'{_WIDE_FETCH_ATTEMPTS} attempts'
+                + (f' ({type(_last_err).__name__})' if _last_err else '') +
+                ' — CDN up but not serving')
+            return False
+        if not _is_media_segment(body):
+            _wide_node_record(host, False)
+            log(f'[WideProbe] first segment is not media ({len(body)}B {body[:12]!r}) — '
+                'the CDN answers but sends no video')
+            return False
+        seen_media = True
+        if _ts_has_audio(body):
+            has_audio = True
             break
-        except Exception as e:
-            # The reason was thrown away here, so the log only ever said "first
-            # segment unreachable" and the real cause stayed invisible.
-            _last_err = e
-            log(f'[WideProbe] segment attempt {attempt + 1}/{_WIDE_FETCH_ATTEMPTS} '
-                f'failed ({type(e).__name__}: {str(e)[:50]})')
-            if attempt < _WIDE_FETCH_ATTEMPTS - 1:
-                time.sleep(0.4)
-    else:
-        _wide_node_record(host, False)
-        log(f'[WideProbe] first segment unreachable after '
-            f'{_WIDE_FETCH_ATTEMPTS} attempts'
-            + (f' ({type(_last_err).__name__})' if _last_err else '') +
-            ' — CDN up but not serving')
+    if not seen_media:
         return False
-
-    if not _is_media_segment(body):
-        _wide_node_record(host, False)
-        log(f'[WideProbe] first segment is not media ({len(body)}B {body[:12]!r}) — '
-            'the CDN answers but sends no video')
-        return False
+    if has_audio:
+        _wide_media_audio[_wide_seg_key(media_url)] = True
+        _wide_node_record(host, True)
+        log(f'[WideProbe] first segment OK ({len(body)}B MPEG-TS, '
+            f'audio=yes), stream is real')
+        return True
+    _wide_media_audio[_wide_seg_key(media_url)] = False
     _wide_node_record(host, True)
-    log(f'[WideProbe] first segment OK ({len(body)}B MPEG-TS), stream is real')
+    log(f'[WideProbe] first segment OK ({len(body)}B MPEG-TS, '
+        f'audio=no), stream is real')
     return True
 
 
@@ -6890,6 +7240,67 @@ def _ts_payload_offset(body, window=20, min_ratio=0.8):
         if hits >= window * min_ratio:
             return off
     return -1
+
+
+_TS_AUDIO_STREAM_TYPES = frozenset((0x03, 0x04, 0x0F, 0x11, 0x81, 0x82, 0x83, 0x87))
+
+
+def _ts_has_audio(body):
+    """True when a TS segment's PMT declares an audio stream that carries packets.
+
+    Some wideiptv nodes keep the audio PID in the PMT but never mux a packet into
+    it. Checking that the PID is declared is not enough: inputstream.adaptive
+    marks that audio as included in the video stream and its TS reader then waits
+    forever for audio stream info, so the video stream never gets SPS/PPS
+    extradata and Kodi refuses to open it. An unparseable PMT is reported as
+    False, which only causes audio to be split into its own rendition; audio
+    still plays there if the packets are actually present.
+    """
+    off = _ts_payload_offset(body)
+    if off < 0:
+        return False
+    pmt_pids = set()
+    audio_pids = set()
+    seen_pids = set()
+    for i in range(off, len(body) - 187, 188):
+        p = body[i:i + 188]
+        if p[0] != 0x47:
+            continue
+        pid = ((p[1] & 0x1f) << 8) | p[2]
+        seen_pids.add(pid)
+        if not ((p[1] >> 6) & 1):
+            continue
+        afc = (p[3] >> 4) & 3
+        pos = 4
+        if afc & 2:
+            pos = 5 + p[4]
+        if not (afc & 1) or pos >= 188:
+            continue
+        payload = p[pos:]
+        if not payload:
+            continue
+        ptr = payload[0]
+        sec = payload[1 + ptr:]
+        if pid == 0 and len(sec) >= 8 and sec[0] == 0x00:
+            slen = ((sec[1] & 0x0f) << 8) | sec[2]
+            end = min(3 + slen - 4, len(sec))
+            for j in range(8, end - 3, 4):
+                prog = (sec[j] << 8) | sec[j + 1]
+                if prog:
+                    pmt_pids.add(((sec[j + 2] & 0x1f) << 8) | sec[j + 3])
+        elif pid in pmt_pids and len(sec) >= 12 and sec[0] == 0x02:
+            slen = ((sec[1] & 0x0f) << 8) | sec[2]
+            pilen = ((sec[10] & 0x0f) << 8) | sec[11]
+            j = 12 + pilen
+            end = min(3 + slen - 4, len(sec))
+            while j + 5 <= end:
+                st = sec[j]
+                ep = ((sec[j + 1] & 0x1f) << 8) | sec[j + 2]
+                elen = ((sec[j + 3] & 0x0f) << 8) | sec[j + 4]
+                if st in _TS_AUDIO_STREAM_TYPES:
+                    audio_pids.add(ep)
+                j += 5 + elen
+    return bool(audio_pids & seen_pids)
 
 
 _PTV_CDN_PATTERN = 'https://edge.cowedd4855ws.sbs/premium{id}/index.m3u8'
@@ -7758,6 +8169,7 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
     player_origin = None
     m3u8_url = None
     _premiumtv_hls = False
+    _wide_ts_mode = False
 
     if forced_cdn == '__anyplayer__':
         _cross_channel_url = None
@@ -7929,6 +8341,10 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
             m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/wide/{encoded_slug}/{encoded_url}'
             log(f'[PlayStream] Using wideiptv HLS via wide proxy (inputstream.adaptive): {m3u8_url}')
             _premiumtv_hls = True
+            if _WIDE_TRY_TTS:
+                _wide_ts_mode = True
+                m3u8_url = f'http://127.0.0.1:{_actual_proxy_port or M3U8_PROXY_PORT}/wide-ts/{encoded_slug}/{encoded_url}'
+                log(f'[PlayStream] wideiptv -> continuous-TS proxy: {m3u8_url}')
 
     else:
         # CHEVY path — reuse cached credentials if fresh (< 5 min), otherwise
@@ -8022,6 +8438,28 @@ def _resolve_playback(channel_id, channel_key, forced_cdn):
     return m3u8_url, _premiumtv_hls, use_player6, player_origin
 
 
+def _inputstream_adaptive_available():
+    """True when Kodi has inputstream.adaptive installed and enabled.
+
+    Setting the inputstream property to a missing add-on is silently ignored:
+    Kodi falls back to its native FFmpeg HLS demuxer, which reads segments
+    just-in-time and stalls whenever the upstream playlist is slow. Detect it
+    explicitly so HLS playback can use ffmpegdirect instead of that fallback.
+    """
+    try:
+        available = bool(xbmc.getCondVisibility('System.HasAddon(inputstream.adaptive)'))
+        if available:
+            version = xbmcaddon.Addon('inputstream.adaptive').getAddonInfo('version')
+            log(f'[PlayStream] inputstream.adaptive v{version} available=True')
+        else:
+            log('[PlayStream] inputstream.adaptive available=False')
+        return available
+    except Exception as e:
+        log(f'[PlayStream] inputstream.adaptive check failed: '
+            f'{type(e).__name__}: {e}')
+        return False
+
+
 def PlayStream(link):
     try:
         log(f'[PlayStream] Starting: {link}')
@@ -8106,14 +8544,32 @@ def PlayStream(link):
 
         _is_ts_proxy = not use_player6 and '127.0.0.1' in m3u8_url and '/stream/' in m3u8_url
         _is_m3u8_proxy = not use_player6 and f'/m3u8/{channel_key}' in m3u8_url
+        # wideiptv goes through the continuous-TS proxy: same player as CHEVY
+        # (_handle_stream), with VideoPlayer/FFmpeg owning PTS/DTS. _premiumtv_hls
+        # would force inputstream.adaptive, which re-demuxes every segment twice
+        # and is what made the picture saccade on this node.
+        _is_wide_ts = '/wide-ts/' in m3u8_url
         liz = xbmcgui.ListItem(f'Channel {channel_id}', path=m3u8_url)
         liz.setContentLookup(False)
-        if _premiumtv_hls:
+        if _is_wide_ts:
+            # Continuous MPEG-TS — Kodi's native VideoPlayer (no inputstream needed)
+            liz.setMimeType('video/MP2T')
+        elif _premiumtv_hls:
             # HLS via inputstream.adaptive: Kodi re-polls the live playlist and
             # downloads segments through the /raw/ proxy (premiumtv Referer applied).
             liz.setMimeType('application/vnd.apple.mpegurl')
-            liz.setProperty('inputstream', 'inputstream.adaptive')
-            liz.setProperty('inputstream.adaptive.manifest_type', 'hls')
+            if _inputstream_adaptive_available():
+                liz.setProperty('inputstream', 'inputstream.adaptive')
+                liz.setProperty('inputstream.adaptive.manifest_type', 'hls')
+            else:
+                # Setting an inputstream property for a missing add-on is ignored
+                # and Kodi silently uses its native FFmpeg HLS demuxer, whose
+                # just-in-time segment reads stall on a flaky live playlist.
+                log('[PlayStream] inputstream.adaptive missing — '
+                    'falling back to inputstream.ffmpegdirect for HLS')
+                liz.setProperty('inputstream', 'inputstream.ffmpegdirect')
+                liz.setProperty('inputstream.ffmpegdirect.is_realtime_stream', 'true')
+                liz.setProperty('inputstream.ffmpegdirect.open_mode', 'ffmpeg')
         elif _is_ts_proxy:
             # TS byte stream — use Kodi's native VideoPlayer (no inputstream needed)
             liz.setMimeType('video/MP2T')
@@ -8461,9 +8917,16 @@ def ExtraChannels_Play(url, name='Extra Channel', logo=ICON):
             _infotag.setPlot(name)
 
         if '.m3u8' in url.lower():
-            liz.setProperty('inputstream', 'inputstream.adaptive')
-            liz.setProperty('inputstream.adaptive.manifest_type', 'hls')
             liz.setMimeType('application/vnd.apple.mpegurl')
+            if _inputstream_adaptive_available():
+                liz.setProperty('inputstream', 'inputstream.adaptive')
+                liz.setProperty('inputstream.adaptive.manifest_type', 'hls')
+            else:
+                log('[ExtraChannels_Play] inputstream.adaptive missing — '
+                    'falling back to inputstream.ffmpegdirect for HLS')
+                liz.setProperty('inputstream', 'inputstream.ffmpegdirect')
+                liz.setProperty('inputstream.ffmpegdirect.is_realtime_stream', 'true')
+                liz.setProperty('inputstream.ffmpegdirect.open_mode', 'ffmpeg')
             log('[ExtraChannels_Play] HLS stream detected')
         elif url.lower().endswith('.mp4'):
             liz.setMimeType('video/mp4')
