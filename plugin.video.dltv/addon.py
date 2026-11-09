@@ -1,4 +1,4 @@
-# version: 1.2.82 (must match addon.xml)
+# version: 1.2.83 (must match addon.xml)
 # -*- coding: utf-8 -*- 
 '''
 ***********************************************************
@@ -678,6 +678,8 @@ _WIDE_SEGMENT_TIMEOUT = 20
 _wide_dead_segs = {}            # seg_key -> expiry, for segments the CDN does not have
 _wide_media_audio = {}          # decoded media playlist key -> True/False (audio PID carries packets)
 _WIDE_TRY_TTS = True           # route wideiptv through the continuous-TS proxy (see _resolve_playback)
+_WIDE_TRY_HLS = True           # use wide HLS (ISA) when the continuous-TS proxy stalls
+_WIDE_TLS_SEG_CACHE_MAX = 16    # ~10-12 MB at 704x396 (1.1-1.4 MB/segment); HLS needs 2 streams in flight
 _wide_seg_keys = []             # insertion order, for bounded eviction
 _WIDE_SEG_CACHE_MAX = 8         # ~5 MB each at 1080p — keep memory in check
 _WIDE_PREFETCH_AHEAD = 6        # how many upcoming segments to chase per playlist
@@ -3474,10 +3476,7 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
 
             def _download():
                 last_content = time.time()
-                _last_seq = [None]
                 _last_prog = [None]
-                _disc_spent = [0]
-                _disc_end = [None]
                 chosen_first = [None]
                 while not _proxy_abort.is_set() and not _client_gone.is_set():
                     try:
@@ -3498,16 +3497,16 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                         seg_prog_map = {}
                         _last_inf = tgt_dur
                         _cur_prog = None
-                        _discont = False
                         for _sl in rr.text.splitlines():
                             _sl = _sl.strip()
                             if _sl.startswith('#EXT-X-PROGRAM-DATE-TIME:'):
                                 try:
-                                    _cur_prog = float(_sl[23:])
+                                    _cur_prog = datetime.fromisoformat(
+                                        _sl[23:].rstrip('Z')).replace(
+                                        tzinfo=timezone.utc).timestamp()
                                 except Exception:
                                     _cur_prog = None
                             elif _sl.startswith('#EXT-X-DISCONTINUITY'):
-                                _discont = True
                                 continue
                             if _sl.startswith('#EXTINF:'):
                                 try:
@@ -3520,7 +3519,7 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                                 seg_dur_map[_su] = _last_inf
                                 seg_prog_map[_su] = _cur_prog
                                 _last_inf = tgt_dur
-                        new_segs = [u for u in segs if u not in seen_urls]
+                        new_segs = [u for u in segs if _wide_seg_key(u) not in seen_urls]
                         new_idx = [segs.index(u) for u in new_segs]
                         # Drop the first poll if it opens on a stale window:
                         # the playlist's oldest segment can be minutes behind a
@@ -3538,9 +3537,6 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                         # old clock, adding seconds of AV error and repeated drops.
                         # End the stream before the splice so Kodi reopens at the
                         # new edge instead of decoding through the join.
-                        if _disc_end[0] is not None and _disc_spent[0] == 0:
-                            _disc_end[0] += 1
-                        _found_disc = False
                         for _i, _u in zip(new_idx, new_segs):
                             _sp = seg_prog_map.get(_u)
                             if _last_prog[0] is not None and _sp is not None:
@@ -3552,8 +3548,6 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                                     _client_gone.set()
                                     return
                             _last_prog[0] = _sp if _sp is not None else _last_prog[0]
-                            if _i > 0 and rr.text.splitlines()[0:1]:
-                                pass
                         if not new_segs:
                             if time.time() - last_content >= _STALL_MAX:
                                 log(f'[WideTsProxy] stall >{int(_STALL_MAX)}s — ending stream')
@@ -3583,8 +3577,12 @@ class _EPlayerProxyHandler(BaseHTTPRequestHandler):
                                     log(f'[WideTsProxy] non-media seg {len(body)}B '
                                         f'{_wide_log_tail(seg_url)}')
                                     continue
+                                if body[:1] == b'\x47':
+                                    body = _ts_strip_audio(body)
                                 _wide_cache_store(key, body)
-                            seen_urls.add(seg_url)
+                            else:
+                                body = _ts_strip_audio(body)
+                            seen_urls.add(_wide_seg_key(seg_url))
                             seg_dur = seg_dur_map.get(seg_url, tgt_dur)
                             while not _client_gone.is_set() and not _proxy_abort.is_set():
                                 try:
@@ -7352,6 +7350,171 @@ def _ts_has_audio(body):
                     audio_pids.add(ep)
                 j += 5 + elen
     return bool(audio_pids & seen_pids)
+
+
+def _ts_strip_audio(body):
+    """Rewrite a TS segment with the audio stream removed from the PMT.
+
+    used when a segment declares an audio PID but carries no audio packets. The
+    declared-but-empty audio makes FFmpeg open an AAC stream that never produces
+    a frame: Kodi prints "large audio sync error" forever, stalls the picture,
+    and eventually dies with "stream stalled" — exactly the 1.2.81 failure on
+    ch.463, where later probing showed the whole window video-only.
+    Removing the PMT entry (and cropping the audio packets if there were any)
+    makes the stream unambiguously video-only: FFmpeg opens one stream, the
+    audio clock disappears, and video plays smooth and silent.
+    The PAT and PCR are left untouched; continuity counters of the remaining
+    PIDs are preserved because packets are only omitted, never re-numbered.
+    """
+    off = _ts_payload_offset(body)
+    if off < 0 or _ts_has_audio(body):
+        return body
+    # Find the PMT PID(s) from the PAT.
+    pmt_pids = set()
+    for i in range(off, len(body) - 187, 188):
+        p = body[i:i + 188]
+        if p[0] != 0x47:
+            continue
+        pid = ((p[1] & 0x1f) << 8) | p[2]
+        if pid != 0 or not ((p[1] >> 6) & 1):
+            continue
+        afc = (p[3] >> 4) & 3
+        pos = 4
+        if afc & 2:
+            pos = 5 + p[4]
+        if not (afc & 1) or pos >= 188:
+            continue
+        payload = p[pos:]
+        if not payload:
+            continue
+        ptr = payload[0]
+        sec = payload[1 + ptr:]
+        if len(sec) < 8 or sec[0] != 0x00:
+            continue
+        slen = ((sec[1] & 0x0f) << 8) | sec[2]
+        end = min(3 + slen - 4, len(sec))
+        for j in range(8, end - 3, 4):
+            prog = (sec[j] << 8) | sec[j + 1]
+            if prog:
+                pmt_pids.add(((sec[j + 2] & 0x1f) << 8) | sec[j + 3])
+    if not pmt_pids:
+        return body
+    # Find the audio PIDs declared in the PMT(s).
+    audio_pids = set()
+    for i in range(off, len(body) - 187, 188):
+        p = body[i:i + 188]
+        if p[0] != 0x47:
+            continue
+        pid = ((p[1] & 0x1f) << 8) | p[2]
+        if pid not in pmt_pids or not ((p[1] >> 6) & 1):
+            continue
+        afc = (p[3] >> 4) & 3
+        pos = 4
+        if afc & 2:
+            pos = 5 + p[4]
+        if not (afc & 1) or pos >= 188:
+            continue
+        payload = p[pos:]
+        if not payload:
+            continue
+        ptr = payload[0]
+        sec = payload[1 + ptr:]
+        if len(sec) < 12 or sec[0] != 0x02:
+            continue
+        slen = ((sec[1] & 0x0f) << 8) | sec[2]
+        pilen = ((sec[10] & 0x0f) << 8) | sec[11]
+        j = 12 + pilen
+        end = min(3 + slen - 4, len(sec))
+        while j + 5 <= end:
+            st = sec[j]
+            ep = ((sec[j + 1] & 0x1f) << 8) | sec[j + 2]
+            elen = ((sec[j + 3] & 0x0f) << 8) | sec[j + 4]
+            if st in _TS_AUDIO_STREAM_TYPES:
+                audio_pids.add(ep)
+            j += 5 + elen
+    if not audio_pids:
+        return body
+    out = bytearray()
+    out += body[:off]
+    # Rewrite every PMT packet (drop the audio entry, fix section length + CRC),
+    # and drop audio packets everywhere (there usually are none).
+    # CRC: see ISO 13818-1, the PMT section is covered by a 4-byte CRC32.
+    # The CRC is computed over exactly the bytes counted in section_length
+    # minus the trailing CRC itself — i.e. sec[0:3+slen-4].
+    # PMT sections are small (< 184 bytes), so one TS packet per section; if a
+    # section ever straddles packets we skip it rather than emit broken tables.
+    for i in range(off, len(body) - 187, 188):
+        p = bytearray(body[i:i + 188])
+        if p[0] != 0x47:
+            out += p
+            continue
+        pid = ((p[1] & 0x1f) << 8) | p[2]
+        if pid in audio_pids:
+            continue
+        if pid not in pmt_pids or not ((p[1] >> 6) & 1):
+            out += p
+            continue
+        afc = (p[3] >> 4) & 3
+        pos = 4
+        if afc & 2:
+            pos = 5 + p[4]
+        if not (afc & 1) or pos >= 188:
+            out += p
+            continue
+        payload = p[pos:]
+        if not payload:
+            out += p
+            continue
+        ptr = payload[0]
+        # The section is sec = payload[1+ptr:] (with CRC). Rebuild the entries
+        # dropping the audio one.
+        sec = bytearray(payload[1 + ptr:])
+        if len(sec) < 12 or sec[0] != 0x02:
+            out += p
+            continue
+        slen = ((sec[1] & 0x0f) << 8) | sec[2]
+        pilen = ((sec[10] & 0x0f) << 8) | sec[11]
+        j = 12 + pilen
+        end = min(3 + slen - 4, len(sec))
+        built = bytearray(sec[:12 + pilen])
+        dropped = False
+        while j + 5 <= end:
+            st = sec[j]
+            ep = ((sec[j + 1] & 0x1f) << 8) | sec[j + 2]
+            elen = ((sec[j + 3] & 0x0f) << 8) | sec[j + 4]
+            entry = sec[j:j + 5 + elen]
+            if st in _TS_AUDIO_STREAM_TYPES and ep in audio_pids:
+                dropped = True
+            else:
+                built += entry
+            j += 5 + elen
+        if not dropped:
+            out += p
+            continue
+        # Update section length (section_syntax_indicator + 10-bit length) and
+        # trailing CRC32 over the new section (excluding the CRC itself).
+        new_slen = len(built) + 4 - 3
+        built[0] = sec[0]
+        built[1] = (sec[1] & 0xF0) | ((new_slen >> 8) & 0x0F)
+        built[2] = new_slen & 0xFF
+        crc_data = bytes(built)
+        crc = 0xFFFFFFFF
+        for b in crc_data:
+            crc ^= b << 24
+            for _ in range(8):
+                crc = ((crc << 1) ^ 0x04C11DB7) & 0xFFFFFFFF if crc & 0x80000000 else (crc << 1) & 0xFFFFFFFF
+        built += struct.pack('>I', crc & 0xFFFFFFFF)
+        # Patch the packet: write the new section back and stuff the tail.
+        newsec = bytes(built)
+        room = 188 - pos - 1
+        if len(newsec) > room:
+            out += p
+            continue
+        p[pos + 1:pos + 1 + len(newsec)] = newsec
+        for k in range(pos + 1 + len(newsec), 188):
+            p[k] = 0xFF
+        out += p
+    return bytes(out)
 
 
 _PTV_CDN_PATTERN = 'https://edge.cowedd4855ws.sbs/premium{id}/index.m3u8'
